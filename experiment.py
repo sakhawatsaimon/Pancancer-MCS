@@ -26,8 +26,7 @@ from cifrus.cifrus import CiFRUS
 from utils import (format_time, scores_to_metrics,
                    BaselineAugmentation, BaselineTransformation)
 from dataloader import (load_single_cancer_datasets,
-                        load_pan_cancer_datasets,
-                        load_tcga)
+                        load_pan_cancer_datasets)
 
 import itertools
 import time
