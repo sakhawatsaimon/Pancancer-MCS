@@ -1,12 +1,12 @@
+% Required package:
+% http://www.yelabs.net/software/MALSAR/#download
+
 %% Load TCGA data
 
-%addpath(genpath("HDD/ruanlab/Saimon/MALSAR"));
-%addpath("HDD/ruanlab/Saimon/Pancancer Outcome Prediction");
 basedir = ".";
 data_dir = sprintf("%s/datasets/TCGA/exported/", basedir);
 
 %%
-
 
 X = table2array(readtable(strcat(data_dir, 'X.csv'), 'Delimiter', '\t', 'ReadVariableNames', false));
 y = table2array(readtable(strcat(data_dir, 'y.csv'), 'Delimiter', '\n', 'ReadVariableNames', false));
@@ -136,25 +136,6 @@ for j = 1:length(mtl_method_list)
     fprintf("Mean AUC: %3f\n", mean(auc));
 end
 
-%% Debug the model weights and Train performance
-
-
-debug_ctype = 'BRCA';
-fprintf("Weights for the first feature:\n")
-disp(W(1, :));
-fprintf("Non-zero weights by cancer-type:\n");
-disp(sum(~(W == 0), 1));
-debug_mask = strcmp(ctypes_unique, debug_ctype);
-y_train_pred = X_train_mtl{debug_mask} * W(:, debug_mask) + c(debug_mask);
-y_train_pred = (y_train_pred > 0)*2-1;
-y_train_true = y_train_mtl{debug_mask};
-fprintf("Train performance on %s\n", debug_ctype);
-fprintf("y_pred: %d pos, %d neg, %d total\n", ...
-    [sum(y_train_pred == 1); sum(y_train_pred == -1); length(y_train_pred)]);
-fprintf("y_true: %d pos, %d neg, %d total\n", ...
-    [sum(y_train_true == 1); sum(y_train_true == -1); length(y_train_true)]);
-fprintf("Accuracy: %.3f percent\n", ...
-    sum((y_train_pred == y_train_true))*100/length(y_train_true));
 %% CMTL hyperparams grid search
 
 % Options
