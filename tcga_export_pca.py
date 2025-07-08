@@ -3,7 +3,7 @@
 """
 Created on Fri Jan 17 15:40:45 2025
 
-@author: ruanlab
+@author: Sakhawat
 """
 
 import numpy as np
@@ -13,11 +13,6 @@ from cifrus.cifrus import CiFRUS
 from pathlib import Path
 
 from dataloader import load_tcga
-
-def test(var = None):
-    if not var:
-        return "Hello";
-    return "Hello, " + str(var)
 
 # For MATLAB external use
 def get_tcga_stratified_split(fold,ds_obj, n_splits = 10, pca = True, augment = False, random_state = 2024):
