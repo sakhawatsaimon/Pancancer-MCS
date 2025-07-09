@@ -71,7 +71,7 @@ end
 opts.maxIter = 1000;
 opts.init = 0;
 
-mtl_method_list = {'CMTL', 'CASO'};
+mtl_method_list = {'LASSO', 'CMTL', 'CASO'};
 
 for j = 1:length(mtl_method_list)
     mtl_method = mtl_method_list{j};
