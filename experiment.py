@@ -6,15 +6,12 @@ Created on Tue Nov 12 16:01:57 2024
 @author: Sakhawat, Tanzira
 """
 
-import matplotlib.pyplot as plt
-import seaborn as sns
 import numpy as np
 import pandas as pd
 import scipy
-from scipy.io import loadmat, mmread
-from scipy.spatial.distance import squareform, correlation
+from scipy.spatial.distance import correlation
 
-from sklearn.model_selection import StratifiedKFold, LeaveOneOut
+from sklearn.model_selection import StratifiedKFold
 from sklearn.decomposition import PCA
 from sklearn.linear_model import LogisticRegression
 from sklearn.neighbors import KNeighborsClassifier
@@ -23,7 +20,7 @@ import xgboost as xgb
 
 
 from cifrus.cifrus import CiFRUS
-from utils import (format_time, scores_to_metrics,
+from utils import (format_time,
                    BaselineAugmentation, BaselineTransformation)
 from dataloader import (load_single_cancer_datasets,
                         load_pan_cancer_datasets)
@@ -54,9 +51,11 @@ class SampleSelector():
         y_train_h = self.y_train[mask]
         if len(np.unique(y_train_h)) < 2:
             counts = {k: v for k, v in zip(*np.unique(y_train_h, return_counts = True))}
-            print(f'\t\tSample underflow: {h=:.3f}, {counts=}')
+            print(f'\t\tDepletion: {h=:.3f}, {counts=}')
             if not self.underflow_resolution:
                 pass
+        if len(X_train_h) == len(self.X_train):
+            print(f'\t\tSaturation: {h=:.3f}, min correlation = {self.corr[j].min()}')
         return X_train_h, y_train_h
     
 def save_feature_importances(clf, filename, as_sparse = True):
@@ -92,7 +91,6 @@ def evaluate_mcs(X_train,
                  use_cache = True,
                  progress_text_prefix = ""):
     global result_cfg
-    UNDERFLOW_POLICY = "baseline"
     H = np.arange(0.15, 0.25+0.025, 0.025).round(3)
 
     configs = itertools.product(augmentation.items(), transform.items())
@@ -171,14 +169,14 @@ def evaluate_mcs(X_train,
                     if np.unique(y_train_h).shape[0] < 2:
                         # traning set contains too few samples (underflow), use baseline as placeholder
                         score_df.loc[j, str(h)] = augmenter.resample_predict_proba(clf_base.predict_proba,
-                                                                                     xt)[0, 1]
+                                                                                   xt)[0, 1]
                     else:     
                         # no underflow, train h-model
                         clf = get_classifier()
                         clf.fit(X_train_h, y_train_h)
                         save_feature_importances(clf, model_attr_path)
                         score_df.loc[j, str(h)] = augmenter.resample_predict_proba(clf.predict_proba,
-                                                                                     xt)[0, 1]
+                                                                                   xt)[0, 1]
             cache_path.parent.mkdir(parents=True, exist_ok=True)
             score_df = score_df.astype(float).round(6)
             score_df.loc[j].to_csv(cache_path, header = None, sep = '\t', float_format = '%.6f')

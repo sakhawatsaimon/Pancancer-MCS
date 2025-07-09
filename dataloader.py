@@ -126,7 +126,6 @@ def load_tcga(return_cancer_types = False):
 def load_single_cancer_datasets():
     yield 'NKI', load_nki()
     yield 'ACES', load_aces()
-    #yield 'METABRIC', load_metabric()
     ds = load_tcga()
     X, y = ds.X, ds.y
     for cancer_type in np.unique(ds.cancer_type):
