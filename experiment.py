@@ -16,6 +16,7 @@ from sklearn.decomposition import PCA
 from sklearn.linear_model import LogisticRegression
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.neural_network import MLPClassifier
 import xgboost as xgb
 
 
@@ -202,8 +203,8 @@ except:
 SEED = 2024
 dry_run = False
 n_splits = 10
-classifier_names = ['LR', 'RF', 'XGB'] # ('LR', 'RF', 'XGB', 'KNN')
-augmentation_type = ['Baseline'] # ('Baseline', 'CiFRUS')
+classifier_names = ['LR', 'RF', 'MLP', 'XGB'] # ('LR', 'RF', 'XGB', 'KNN')
+augmentation_type = ['Baseline', 'CiFRUS'] # ('Baseline', 'CiFRUS')
 experiment_type = 'pan_cancer_stratified' # 'single_cancer' | 'pan_cancer' | 'pan_cancer_stratified'
 use_cache = True
 
@@ -215,6 +216,7 @@ classifier_map = {
                     'RF': lambda: RandomForestClassifier(random_state = SEED, n_jobs = -1),
                     'XGB': lambda: xgb.XGBClassifier(random_state = SEED, n_jobs = None),
                     'LR': lambda: LogisticRegression(random_state = SEED, n_jobs = -1),
+                    'MLP': lambda: MLPClassifier(n_jobs = -1),
                     'KNN': lambda: KNeighborsClassifier(n_neighbors = 40, metric = correlation)
                  }
 

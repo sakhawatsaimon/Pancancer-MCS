@@ -9,9 +9,6 @@ Created on Tue Dec 17 13:43:06 2024
 import numpy as np
 import pandas as pd
 from scipy.io import loadmat
-from sklearn.model_selection import StratifiedKFold
-from sklearn.decomposition import PCA
-from cifrus.cifrus import CiFRUS
 
 ''' Wrapper class for data'''
 class DataSet():
@@ -20,6 +17,7 @@ class DataSet():
         self.y = y
         self.cancer_type = cancer_type
         self.feature_info = feature_info
+        self.attributes = {}
 
 def get_tfs():
     url = 'https://humantfs.ccbr.utoronto.ca/download/v_1.01/DatabaseExtract_v_1.01.txt'
@@ -36,7 +34,10 @@ def load_aces():
     entrez_ids = loadmat(basepath + 'ACES_EntrezIds.mat')['entrez_ids']
     X = pd.DataFrame(X)
     X.columns = entrez_ids.reshape(-1)
-    return DataSet(X.values, y, cancer_type = 'ACES_BRCA', feature_info = entrez_ids)
+    subtypes = pd.read_csv(basepath + 'ACES_Subtypes.csv', header = None).squeeze()
+    ds_obj = DataSet(X.values, y, cancer_type = 'ACES_BRCA', feature_info = entrez_ids)
+    ds_obj.attributes['subtypes'] = subtypes
+    return ds_obj
 
 def load_nki():
     basepath = './datasets/NKI/'
