@@ -69,7 +69,7 @@ def scores_to_metrics(scores, y_true, p_threshold = 0.5):
 
 class BaselineAugmentation():
     """
-    This class implements no augmentation (baseline)
+    This class implements identity augmentation (baseline)
     """
     def __init__(self, **kwargs):
         pass
@@ -90,7 +90,7 @@ class BaselineAugmentation():
 
 class BaselineTransformation:
     """
-    This class implements no augmentation (baseline)
+    This class implements identity feature transformation (baseline)
     """
     def __init__(self, **kwargs):
         pass
