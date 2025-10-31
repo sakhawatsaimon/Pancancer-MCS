@@ -34,13 +34,13 @@ scores_basedir = f"{results_basedir}/pred_probability/"
 model_attr_basedir = f"{results_basedir}/feature_scores/"
 cache_basedir = f"{results_basedir}/cache/"
 
+Path(FIGURE_SAVEDIR).mkdir(parents = True, exist_ok = True)
 
 tcga_dataset = load_tcga()
 
 def savefig(filename, extension = 'eps'):
     if not WRITE_RESULTS:
         return
-    Path(FIGURE_SAVEDIR).mkdir(parents = True, exist_ok = True)
     plt.savefig('{}/{}.{}'.format(FIGURE_SAVEDIR, filename, extension), 
                 bbox_inches = 'tight', dpi = 300)
 
@@ -66,6 +66,41 @@ def highlight_top_two(df, higher_is_better = True, ci = None,
                 + ci.map(('$\\pm$' + ci_precision_str).format) \
                 + rank.replace({1: first_end, 2: second_end, -1: ''})
     return table
+
+#%% TCGA Dataset: plot good/poor samples per cancer type
+
+df = pd.DataFrame([tcga_dataset.y, tcga_dataset.cancer_type],
+                  index = ['Outcome', 'Cancer type']).T
+df['Outcome'] = df['Outcome'].replace({0: 'Good', 1: 'Poor'})
+counts = pd.crosstab(df['Cancer type'], df['Outcome'])
+fig, axes = plt.subplots(figsize = (4, 6), ncols = 3, sharey = True,
+                         gridspec_kw = {'width_ratios': [5, 2, 5],
+                                        'wspace': 0.05})
+counts['Good'].plot.barh(ax = axes[0])
+counts['Poor'].plot.barh(ax = axes[2], color = 'C1')
+axes[0].set_xlim(counts.max().max(), 0)
+axes[2].set_xlim(0, counts.max().max())
+for i, ctype in enumerate(counts.index):
+    axes[1].text(0.5, i, ctype, va = 'center', ha = 'center')
+for ax in axes:
+    ax.yaxis.set_inverted(True)
+    
+axes[0].set_yticks([])
+axes[1].set_xticks([])
+
+axes[0].tick_params(which='both', bottom=True, top=False, left=False, right=False)
+axes[2].tick_params(which='both', bottom=True, top=False, left=False, right=False)
+axes[1].tick_params(which='both', bottom=False, top=False, left=False, right=False)
+
+axes[0].set_ylabel('')
+axes[0].set_xlabel('Good')
+axes[2].set_xlabel('Poor')
+sns.despine(ax = axes[0], left = True, bottom = False)
+sns.despine(ax = axes[2], left = True, bottom = False)
+sns.despine(ax = axes[1], left = True, bottom = True)
+axes[2].set_xticks(axes[0].get_xticks())
+axes[0].set_xticks(axes[0].get_xticks())
+plt.show()
 
 #%% TCGA: load pred proba scores
 
