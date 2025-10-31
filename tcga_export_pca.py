@@ -78,5 +78,5 @@ def write_split_files(n_splits = 10, pca = True, augment = False, random_state =
         np.savetxt(f'{fold_dir}/ctype_train.csv', ctype_train, fmt = "%s", delimiter = '\t')
         np.savetxt(f'{fold_dir}/ctype_test.csv', ctype_test, fmt = "%s", delimiter = '\t')
         
-        
-write_split_files()
+if __name__ == "__main__":   
+    write_split_files()

@@ -187,111 +187,111 @@ def evaluate_mcs(X_train,
     scores = pd.concat(scores, names = ['augmentation', 'transformation', 'idx'])
     return scores
 
-
-# For parallel execution, no need to change if running a single python instance
-try:
-    node_id, total_nodes = int(sys.argv[1]), int(sys.argv[2])
-    print('New node with nnodes={}, offset={}'.format(total_nodes, node_id))
-except:
-    print('Running single node')
-    total_nodes, node_id = 1, 0
-
-# -----------------------------------------------------------------------------
-# Experiment set-up
-# -----------------------------------------------------------------------------
-
-SEED = 2024
-dry_run = False
-n_splits = 10
-classifier_names = ['LR', 'RF', 'MLP', 'XGB'] # ('LR', 'RF', 'XGB', 'KNN')
-augmentation_type = ['Baseline', 'CiFRUS'] # ('Baseline', 'CiFRUS')
-experiment_type = 'pan_cancer_stratified' # 'single_cancer' | 'pan_cancer' | 'pan_cancer_stratified'
-use_cache = True
-
-# -----------------------------------------------------------------------------
-# End experiment set-up
-# -----------------------------------------------------------------------------
-
-classifier_map = {
-                    'RF': lambda: RandomForestClassifier(random_state = SEED, n_jobs = -1),
-                    'XGB': lambda: xgb.XGBClassifier(random_state = SEED, n_jobs = None),
-                    'LR': lambda: LogisticRegression(random_state = SEED, n_jobs = -1),
-                    'MLP': lambda: MLPClassifier(n_jobs = -1),
-                    'KNN': lambda: KNeighborsClassifier(n_neighbors = 40, metric = correlation)
-                 }
-
-
-basedir = "./results"
-scores_basedir = f"{basedir}/pred_probability/{experiment_type}"
-model_attr_basedir = f"{basedir}/feature_scores/{experiment_type}"
-cache_basedir = f"{basedir}/cache/{experiment_type}"
-
-augmentation_map = {
-                    'CiFRUS': CiFRUS(random_state = SEED),
-                    'Baseline': BaselineAugmentation(random_state = SEED),
-                   }
-transform_map = {
-                'PCA': PCA(n_components = 0.95),
-                'Baseline': BaselineTransformation()
-                }
-
-if experiment_type == 'single_cancer':
-    load_datasets = load_single_cancer_datasets
-elif experiment_type.startswith('pan_cancer'):
-    load_datasets = load_pan_cancer_datasets
-else:
-    print('Invalid experiment type')
-    load_datasets = lambda: None
-
-# for dataset_name, (X, y) in load_datasets():
-for dataset_name, ds_obj in load_datasets():
-    X, y = ds_obj.X, ds_obj.y
-    transform_type = ['Baseline']
-    if dataset_name.startswith('TCGA'):
-        transform_type = ['PCA']
-
-    augmenters = {k: v for k, v in augmentation_map.items() if k in augmentation_type}
-    feature_transformers = {k: v for k, v in transform_map.items() if k in transform_type}
-    assert len(augmenters) > 0
-    assert len(feature_transformers) > 0
-
-    for classifier_name in classifier_names:
-        print('Dataset: ', dataset_name)
-        print('Augmentation Configs:', list(augmenters.keys()))
-        print('Transform Configs:', list(feature_transformers.keys()))
-        print('Classifier:', classifier_name)
-        # -----------------------------------------------------------------------------
-        get_classifier = classifier_map[classifier_name]
-        dir_scores = Path(f"{scores_basedir}/{dataset_name}/{classifier_name}")
-        Path(dir_scores).mkdir(parents = True, exist_ok = True)
-        skf = StratifiedKFold(n_splits = n_splits, shuffle = True, random_state = SEED)
-        y_split = y
-        if experiment_type == 'pan_cancer_stratified':
-            y_split = np.array([str(v0) + '_' + str(v1) for v0, v1 in zip(ds_obj.cancer_type, y)])
-        for fold, (train_index, test_index) in enumerate(skf.split(X, y_split)):
-            if fold % total_nodes != node_id:
-                continue
-            print('===================================')
-            print(f'Fold {fold}, Train/Test : {len(train_index)}, {len(test_index)}')
-            print('===================================')
-            X_train, y_train = X[train_index], y[train_index]
-            X_test, y_test = X[test_index], y[test_index]
-            cache_dir = Path(f'{cache_basedir}/{dataset_name}/{classifier_name}/fold_{fold}/')
-            model_attr_dir = Path(f'{model_attr_basedir}/{dataset_name}/{classifier_name}/fold_{fold}/')
-            np.savetxt(f'{dir_scores}/test_index_fold_{fold}.csv', test_index, fmt = '%d', delimiter = '\n')
-            if dry_run:
-                continue
-            scores_fold = evaluate_mcs(X_train,
-                                       y_train,
-                                       X_test,
-                                       y_test,
-                                       get_classifier,
-                                       augmenters,
-                                       feature_transformers,
-                                       cache_dir,
-                                       model_attr_dir,
-                                       use_cache = use_cache,
-                                       progress_text_prefix = "Node {:}".format(node_id))
-            scores_fold = scores_fold.stack().unstack(level = -2)
-            scores_fold.T.astype(float).to_csv(f'{dir_scores}/scores_fold_{fold}.csv',
-                                               sep = '\t', float_format = '%.6f')
+if __name__ == "__main__":
+    # For parallel execution, no need to change if running a single python instance
+    try:
+        node_id, total_nodes = int(sys.argv[1]), int(sys.argv[2])
+        print('New node with nnodes={}, offset={}'.format(total_nodes, node_id))
+    except:
+        print('Running single node')
+        total_nodes, node_id = 1, 0
+    
+    # -----------------------------------------------------------------------------
+    # Experiment set-up
+    # -----------------------------------------------------------------------------
+    
+    SEED = 2024
+    dry_run = False
+    n_splits = 10
+    classifier_names = ['LR', 'RF', 'MLP', 'XGB'] # ('LR', 'RF', 'XGB', 'KNN')
+    augmentation_type = ['Baseline', 'CiFRUS'] # ('Baseline', 'CiFRUS')
+    experiment_type = 'pan_cancer_stratified' # 'single_cancer' | 'pan_cancer' | 'pan_cancer_stratified'
+    use_cache = True
+    
+    # -----------------------------------------------------------------------------
+    # End experiment set-up
+    # -----------------------------------------------------------------------------
+    
+    classifier_map = {
+                        'RF': lambda: RandomForestClassifier(random_state = SEED, n_jobs = -1),
+                        'XGB': lambda: xgb.XGBClassifier(random_state = SEED, n_jobs = None),
+                        'LR': lambda: LogisticRegression(random_state = SEED, n_jobs = -1),
+                        'MLP': lambda: MLPClassifier(n_jobs = -1),
+                        'KNN': lambda: KNeighborsClassifier(n_neighbors = 40, metric = correlation)
+                     }
+    
+    
+    basedir = "./results"
+    scores_basedir = f"{basedir}/pred_probability/{experiment_type}"
+    model_attr_basedir = f"{basedir}/feature_scores/{experiment_type}"
+    cache_basedir = f"{basedir}/cache/{experiment_type}"
+    
+    augmentation_map = {
+                        'CiFRUS': CiFRUS(random_state = SEED),
+                        'Baseline': BaselineAugmentation(random_state = SEED),
+                       }
+    transform_map = {
+                    'PCA': PCA(n_components = 0.95),
+                    'Baseline': BaselineTransformation()
+                    }
+    
+    if experiment_type == 'single_cancer':
+        load_datasets = load_single_cancer_datasets
+    elif experiment_type.startswith('pan_cancer'):
+        load_datasets = load_pan_cancer_datasets
+    else:
+        print('Invalid experiment type')
+        load_datasets = lambda: None
+    
+    # for dataset_name, (X, y) in load_datasets():
+    for dataset_name, ds_obj in load_datasets():
+        X, y = ds_obj.X, ds_obj.y
+        transform_type = ['Baseline']
+        if dataset_name.startswith('TCGA'):
+            transform_type = ['PCA']
+    
+        augmenters = {k: v for k, v in augmentation_map.items() if k in augmentation_type}
+        feature_transformers = {k: v for k, v in transform_map.items() if k in transform_type}
+        assert len(augmenters) > 0
+        assert len(feature_transformers) > 0
+    
+        for classifier_name in classifier_names:
+            print('Dataset: ', dataset_name)
+            print('Augmentation Configs:', list(augmenters.keys()))
+            print('Transform Configs:', list(feature_transformers.keys()))
+            print('Classifier:', classifier_name)
+            # -----------------------------------------------------------------------------
+            get_classifier = classifier_map[classifier_name]
+            dir_scores = Path(f"{scores_basedir}/{dataset_name}/{classifier_name}")
+            Path(dir_scores).mkdir(parents = True, exist_ok = True)
+            skf = StratifiedKFold(n_splits = n_splits, shuffle = True, random_state = SEED)
+            y_split = y
+            if experiment_type == 'pan_cancer_stratified':
+                y_split = np.array([str(v0) + '_' + str(v1) for v0, v1 in zip(ds_obj.cancer_type, y)])
+            for fold, (train_index, test_index) in enumerate(skf.split(X, y_split)):
+                if fold % total_nodes != node_id:
+                    continue
+                print('===================================')
+                print(f'Fold {fold}, Train/Test : {len(train_index)}, {len(test_index)}')
+                print('===================================')
+                X_train, y_train = X[train_index], y[train_index]
+                X_test, y_test = X[test_index], y[test_index]
+                cache_dir = Path(f'{cache_basedir}/{dataset_name}/{classifier_name}/fold_{fold}/')
+                model_attr_dir = Path(f'{model_attr_basedir}/{dataset_name}/{classifier_name}/fold_{fold}/')
+                np.savetxt(f'{dir_scores}/test_index_fold_{fold}.csv', test_index, fmt = '%d', delimiter = '\n')
+                if dry_run:
+                    continue
+                scores_fold = evaluate_mcs(X_train,
+                                           y_train,
+                                           X_test,
+                                           y_test,
+                                           get_classifier,
+                                           augmenters,
+                                           feature_transformers,
+                                           cache_dir,
+                                           model_attr_dir,
+                                           use_cache = use_cache,
+                                           progress_text_prefix = "Node {:}".format(node_id))
+                scores_fold = scores_fold.stack().unstack(level = -2)
+                scores_fold.T.astype(float).to_csv(f'{dir_scores}/scores_fold_{fold}.csv',
+                                                   sep = '\t', float_format = '%.6f')
