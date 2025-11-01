@@ -2,7 +2,7 @@
 
 Code repository for the ACM-BCB 2025 short paper ([https://doi.org/10.1145/3765612.3767240](https://doi.org/10.1145/3765612.3767240)).
 
-![Screenshot of a comment on a GitHub issue showing an image, added in the Markdown, of an Octocat smiling and raising a tentacle.](https://github.com/sakhawatsaimon/Pancancer-MCS/blob/main/misc/overview.svg?raw=true)
+![Screenshot of a comment on a GitHub issue showing an image, added in the Markdown, of an Octocat smiling and raising a tentacle.](https://github.com/sakhawatsaimon/Pancancer-MCS/raw/main/misc/overview.svg)
 
 ## Requirements
 
