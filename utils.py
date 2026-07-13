@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 import scipy
 from scipy.spatial.distance import squareform
+from scipy.stats import spearmanr
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
 import xgboost as xgb
@@ -21,7 +22,6 @@ from sklearn.metrics import (
     cohen_kappa_score)
 from pathlib import Path
 
-# Utility function
 def format_time(seconds):
     minutes, seconds = divmod(seconds, 60)
     hours, minutes = divmod(minutes, 60)
@@ -57,9 +57,9 @@ def save_feature_importances(clf, filename, as_sparse = True):
     else:
         np.savetxt(filename + '.csv', feature_importances, fmt = '%.8f')
         
-# Utility function
 def scores_to_metrics(scores, y_true, p_threshold = 0.5):
     '''
+    Calculate performance metrics from class probability scores (y_pred)
     
     Parameters
     ----------
@@ -89,56 +89,55 @@ def scores_to_metrics(scores, y_true, p_threshold = 0.5):
     metric_df = pd.DataFrame(index = scores.index,
                              columns = metrics.keys(),
                              dtype = float)
-    #y_true = scores['Y_true']
     for metric_name, metric_func in metrics.items():
         for cfg in metric_df.index:
             scores_cfg = scores.loc[cfg, :]
-            #print(1/0)
             y_pred = (scores_cfg >= p_threshold).astype(int)
             metric_df.loc[cfg, metric_name] = metric_func(y_true,
                                                           y_pred,
                                                           scores_cfg)
-    #metric_df = metric_df.drop('Y_true')
     return metric_df
 
-# Baseline classes
+class SampleSelector():
+    
+    def __init__(
+        self, similarity_metric = 'pearson',
+        use_absolute_similarity = True,
+        underflow_resolution = None):
 
-class BaselineAugmentation():
-    """
-    This class implements identity augmentation (baseline)
-    """
-    def __init__(self, **kwargs):
-        pass
+        self.similarity_metric = similarity_metric
+        self.use_absolute_similarity = use_absolute_similarity
+        self.underflow_resolution = underflow_resolution
     
-    def fit(self, X_train, **kwargs):
-        pass
-    
-    def resample(self, X, Y = None, **kwargs):
-        if Y is None:
-            return X
-        return X, Y
-    
-    def fit_resample(self, X, Y, **kwargs):
-        return self.resample(X, Y)
-    
-    def resample_predict_proba(self, func_predict_proba, X, **kwargs):
-        return func_predict_proba(X)
+    def fit(self, X_train, y_train, X_test):
+        assert len(X_train) == len(y_train)
+        self.X_train = X_train
+        self.y_train = y_train
+        self.X_test = X_test
+        if self.similarity_metric == 'pearson':
+            self.corr = np.corrcoef(X_test, X_train)[:len(X_test), len(X_test):]
+        elif self.similarity_metric == 'spearman':
+            self.corr = spearmanr(X_test.T, X_train.T)[0][:len(X_test), len(X_test):]
+        else:
+            raise ValueError(f"Unknown similarity metric: {self.similarity_metric}" )
+        return self
 
-class BaselineTransformation:
-    """
-    This class implements identity feature transformation (baseline)
-    """
-    def __init__(self, **kwargs):
-        pass
-    
-    def fit(self, X_train, **kwargs):
-        pass
-    
-    def fit_transform(self, X, **kwargs):
-        return X
-    
-    def transform(self, X, **kwargs):
-        return X
+    def get_similar_sample_idx(self, h, j = 0, as_mask = False):
+        if self.use_absolute_similarity:
+            mask = np.abs(self.corr[j]) >= h
+        else:
+            mask = self.corr[j] >= h
+        if as_mask:
+            return mask
+        idx = np.where(mask)[0]
+        return idx
+        
+    # return samples from X_train that are similar to the j-th test sample
+    def get_similar_samples(self, h, j = 0):
+        mask = self.get_similar_samples(h, j, as_mask = True)
+        X_train_h = self.X_train[mask, :]
+        y_train_h = self.y_train[mask]
+        return X_train_h, y_train_h   
 
 
 class ThresholdSelector(ABC):
@@ -160,24 +159,41 @@ class FixedThresholdSelector(ThresholdSelector):
         self.threshold_labels = H.astype(str)
         self.H = H
         
-    def get_thresholds(self, as_series = False):
+    def get_thresholds(self, *args, as_series = False):
         if as_series:
             return pd.Series(self.H, index = self.get_threshold_labels())
         return self.H
     
 class PercentileThresholdSelector(ThresholdSelector):
     '''Percentile-based thresholds for training local models'''
-    def __init__(self, low_percentile = 65, high_percentile = 90, n_thresholds = 6):
+    def __init__(
+        self,
+        low_percentile = 65,
+        high_percentile = 90,
+        n_thresholds = 6,
+        similarity_metric = 'pearson',
+        use_absolute_similarity = True):
+
         self.low_percentile = low_percentile
         self.high_percentile = high_percentile
         self.n_thresholds = n_thresholds
+        self.similarity_metric = similarity_metric
+        self.use_absolute_similarity = use_absolute_similarity
         self.percentiles = np.linspace(self.low_percentile, self.high_percentile, n_thresholds)
         self.threshold_labels = self.percentiles.round(3).astype(str)
         
     def get_thresholds(self, X, corr = None, as_series = False):
         if corr is None:
-            corr = squareform(np.corrcoef(X), checks = False)
-        H = np.array([np.percentile(np.abs(corr), p) for p in self.percentiles])
+            if self.similarity_metric == 'pearson':
+                corr = squareform(np.corrcoef(X), checks = False)
+            elif self.similarity_metric == 'spearman':
+                corr = squareform(spearmanr(X)[0], checks = False)
+            else:
+                raise ValueError(f"Unknown similarity metric: {self.similarity_metric}" )
+        if self.use_absolute_similarity:
+            corr = np.abs(corr)
+        H = np.array([np.percentile(corr, p) for p in self.percentiles])
         if as_series: 
             return pd.Series(H, index = self.get_threshold_labels())
         return H
+

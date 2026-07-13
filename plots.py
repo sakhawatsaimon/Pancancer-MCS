@@ -12,43 +12,47 @@ import seaborn as sns
 import numpy as np
 import pandas as pd
 from scipy.spatial.distance import squareform
-from scipy.stats import percentileofscore, ttest_rel
+from scipy.stats import percentileofscore, ttest_rel, spearmanr
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.decomposition import PCA
+from sklearn.model_selection import StratifiedKFold
 
-from utils import scores_to_metrics
-from dataloader import (load_single_cancer_datasets,
-                        load_nki,
-                        load_aces,
-                        load_tcga)
+from utils import scores_to_metrics, PercentileThresholdSelector, FixedThresholdSelector
+from dataloader import load_aces, load_tcga
 
 from pathlib import Path
 from itertools import combinations_with_replacement
 
 # random seed
 SEED = 2024
-FIGURE_SAVEDIR = './figures'
-WRITE_RESULTS = False
-results_basedir = './results'
-scores_basedir = f"{results_basedir}/pred_probability/"
-model_attr_basedir = f"{results_basedir}/feature_scores/"
-cache_basedir = f"{results_basedir}/cache/"
+FIGURE_SAVEDIR = './figures_v2'
+WRITE_RESULTS = True
+#results_basedir = './results_v2'
+#scores_basedir = f"{results_basedir}/pred_probability"
+#model_attr_basedir = f"{results_basedir}/feature_scores"
+#cache_basedir = f"{results_basedir}/cache"
+#data_basedir = f"{results_basedir}/data"
 
-Path(FIGURE_SAVEDIR).mkdir(parents = True, exist_ok = True)
-
-tcga_dataset = load_tcga()
+tcga_dataset = load_tcga(return_survival_info = True)
 
 def savefig(filename, extension = 'eps'):
     if not WRITE_RESULTS:
         return
+    Path(FIGURE_SAVEDIR).mkdir(parents = True, exist_ok = True)
     plt.savefig('{}/{}.{}'.format(FIGURE_SAVEDIR, filename, extension), 
                 bbox_inches = 'tight', dpi = 300)
 
 # Utility function to add formatting to tables exported as LaTeX
-def highlight_top_two(df, higher_is_better = True, ci = None,
-                      precision = 2, ci_precision = 2,
-                      first_start = '\\bfseries', first_end = '',
-                      second_start = '\\underline{' ,second_end = '}'):
+def highlight_top_two(
+        df,
+        higher_is_better = True,
+        ci = None,
+        precision = 2,
+        ci_precision = 2,
+        best_start = '\\bfseries',
+        best_end = '',
+        second_best_start = '\\underline{',
+        second_best_end = '}'):
     
     precision_str = '{:.' + str(precision) + 'f}'
     ci_precision_str = '{:.' + str(ci_precision) + 'f}'
@@ -57,17 +61,196 @@ def highlight_top_two(df, higher_is_better = True, ci = None,
         rank = (-df).rank(axis = 1, method = 'min')
     rank[rank > 2] = -1
     if ci is None:
-        table = rank.replace({1: first_start, 2: second_start, -1: ''}) \
+        table = rank.replace({1: best_start, 2: second_best_start, -1: ''}) \
                 + df.map(precision_str.format) \
-                + rank.replace({1: first_end, 2: second_end, -1: ''})
+                + rank.replace({1: best_end, 2: second_best_end, -1: ''})
     else:
-        table = rank.replace({1: first_start, 2: second_start, -1: ''}) \
+        table = rank.replace({1: best_start, 2: second_best_start, -1: ''}) \
                 + df.map(precision_str.format) \
                 + ci.map(('$\\pm$' + ci_precision_str).format) \
-                + rank.replace({1: first_end, 2: second_end, -1: ''})
+                + rank.replace({1: best_end, 2: second_best_end, -1: ''})
     return table
 
-#%% TCGA Dataset: plot good/poor samples per cancer type
+def load_y(path_experiment):
+
+    pred_proba_dir = 'pred_probability'
+    path_data = Path(path_experiment, 'data')
+    
+    y_pred = {}
+    y_true = {}
+    
+    paths_y_true = sorted(list(path_data.rglob('*y_test.csv')))
+    for path_y_true in paths_y_true:
+        y_true_cfg = np.loadtxt(path_y_true, dtype = int)
+        try:
+            ctypes_test = pd.read_csv(Path(path_y_true.parent, 'ctypes_test.csv'), header = None)[0]
+            assert len(y_true_cfg) == len(ctypes_test)
+        except FileNotFoundError:
+            ctypes_test = None
+        
+        fold_dirname = path_y_true.parent.name
+        prefix_len = len(path_y_true.parts) - 5
+        
+        _, transform_name, augment_name, fold_dirname =\
+            path_y_true.parts[prefix_len:-1]
+        fold = int(fold_dirname.split('_')[1])
+        y_true[(transform_name, augment_name, fold)] = pd.DataFrame({
+                'y_true': y_true_cfg,
+                'ctypes': ctypes_test
+            })
+    
+        paths_y_pred = sorted(list(Path(
+            *path_y_true.parts[:prefix_len],
+            pred_proba_dir,
+            transform_name,
+            augment_name)
+            .rglob(f'*/{fold_dirname}')))
+    
+        for path_y_pred in paths_y_pred:
+            classifier_name = path_y_pred.parent.name
+            sample_files = sorted(list(path_y_pred.glob('sample_*')))
+            config = (transform_name, augment_name, classifier_name, fold)
+            print(''.join(['{:15s}'.format(str(val)) for val in config]))
+            
+            y_pred_samples = {}
+            for sample_file in sample_files:
+                sample_id = int(sample_file.stem.split('sample_')[1])
+                df = pd.read_csv(
+                    sample_file, header = None,
+                    sep = '\t', index_col = 0)
+                df = df[1]
+                y_pred_samples[sample_id] = df
+            y_pred_df = pd.concat(y_pred_samples, axis = 1).T.sort_index(axis = 0)
+            y_pred_df.columns.name = 'Model threshold'
+            if y_pred_df.shape[1] > 1:
+                y_pred_df['MCS'] = y_pred_df.mean(axis = 1)
+            y_pred_df['y_true'] = y_true_cfg
+            y_pred_df['ctypes'] = ctypes_test
+            y_pred[config] = y_pred_df
+    return y_pred
+
+def get_y_pred_combined(y_pred):
+    y_pred_combined = {}
+    cfg_df = pd.DataFrame(y_pred.keys(), columns = ['Transform', 'Augment', 'Model', 'Fold'])
+    folds = cfg_df['Fold'].unique()
+    for (transform_name, augment_name), _ in cfg_df.groupby(['Transform', 'Augment']).groups.items():
+        y_pred_models = []
+        for model_name in cfg_df['Model'].unique():
+            y_pred_folds = []
+            for fold in folds:
+                y_pred_folds.append(y_pred[(transform_name, augment_name, model_name, fold)])
+            y_pred_folds = pd.concat(y_pred_folds, axis = 0)
+            y_pred_folds = y_pred_folds.reset_index(drop = True)
+            labels = y_pred_folds[['y_true', 'ctypes']]
+            y_pred_folds = y_pred_folds.drop(labels.columns, axis = 1)
+            if 'MCS' in y_pred_folds.columns:
+                y_pred_folds.columns = model_name + '-' + y_pred_folds.columns
+                y_pred_folds = y_pred_folds.rename(columns = {model_name + '-MCS': 'MCS-' + model_name})
+            else:
+                y_pred_folds.columns = [model_name]
+            y_pred_models.append(y_pred_folds)
+        y_pred_models = pd.concat(y_pred_models, axis = 1)
+        y_pred_models.columns.name = 'Model'
+        y_pred_models = pd.concat([y_pred_models, labels], axis = 1)
+        y_pred_combined[(transform_name, augment_name)] = y_pred_models
+    return y_pred_combined
+
+def get_performance(y_pred):
+    metrics = {}
+    
+    for config, y_pred_df in y_pred.items():
+        y_true_cfg = y_pred_df['y_true']
+        y_pred_df = y_pred_df.drop(['y_true', 'ctypes'], axis = 1)
+        metrics[config] = scores_to_metrics(
+            y_pred_df.T, y_true_cfg, p_threshold = threshold)
+    metrics = pd.concat(metrics)
+    metrics.index.names = [
+        'Transform', 'Augment', 'Classifier', 'Fold', 'Model threshold']
+    metrics = metrics.reorder_levels([0, 1, 2, 4, 3]).sort_index()
+    metrics.columns.name = 'Metric'
+    
+    metrics_mean = metrics.groupby(level = [
+        'Transform', 'Augment', 'Classifier', 'Model threshold']).mean()
+    metrics_ci = metrics.groupby(level = [
+        'Transform', 'Augment', 'Classifier', 'Model threshold']).sem() * 1.96
+    return metrics, metrics_mean, metrics_ci
+
+
+#%% TCGA: [plot] pre-binarization stats
+
+bin_count = 35
+plot_threshold = True
+xticks_years = [0, 5, 10, 15]
+n_cols = 4
+threshold_color = 'C3'
+pfi_map = {0: 'No', 1: 'Yes'}
+
+survival = tcga_dataset.attributes['survival info']
+n_cancers = survival['cancer type abbreviation'].nunique()
+n_rows = int(np.ceil(n_cancers / n_cols))
+
+bin_range = np.linspace(0, survival['PFI.time'].max(), bin_count)
+fig, axes = plt.subplots(
+    nrows = n_rows,
+    ncols = n_cols,
+    figsize = (n_cols*3, n_rows*0.65)
+)
+for i, cancer_type in enumerate(survival['cancer type abbreviation'].unique()):
+    ax = axes.flat[i]
+    data = survival[survival['cancer type abbreviation'] == cancer_type]
+    pfi_threshold = data['PFI threshold'].unique()
+    assert len(pfi_threshold) == 1
+    pfi_threshold = pfi_threshold[0]
+    sns.histplot(
+        data = data,
+        x = 'PFI.time',
+        hue = 'PFI',
+        multiple = 'stack',
+        ax = ax, bins = bin_range,
+        linewidth = 0)
+    ax.set_ylabel('')
+    ax.set_xlabel('')
+    if plot_threshold:
+        y_top = ax.get_ylim()[1]*1.2
+        ax.plot(
+            [pfi_threshold, pfi_threshold],
+            [0, y_top],
+            linestyle = '--', 
+            color = threshold_color,
+            linewidth = 1)
+        ax.text(
+            pfi_threshold, y_top, 
+            '{:.1f}y'.format(pfi_threshold / 365),
+            ha = 'center', va = 'bottom',
+            fontsize = 7, color = threshold_color)
+    handles = ax.legend_.legend_handles
+    labels = [text.get_text() for text in ax.legend_.texts]
+    ax.get_legend().remove()
+    plt.text(0.99, 0.12, cancer_type,
+             transform = ax.transAxes, ha = 'right', va = 'bottom')
+    ax.set_xlim(-500, survival['PFI.time'].max())
+    ax.set_ylim(0, y_top*1.2)
+    ax.set_xticks(np.array(xticks_years)*365, labels = xticks_years)
+    if i + n_cols < n_cancers:
+        ax.set_xticklabels([])
+    sns.despine(ax = ax)
+i += 1
+while i < axes.size:
+    axes.flat[i].axis('off')
+    i += 1
+    
+fig.add_subplot(111, frameon=False)
+plt.tick_params(labelcolor='none', which='both', top=False, bottom=False, left=False, right=False)
+plt.xlabel('PFI time (years)', labelpad = 5)
+plt.ylabel('Count', labelpad = 5)
+plt.legend(handles, labels, loc = 'lower center',
+           bbox_to_anchor = [0.5, 1], ncols = 2,
+           title = 'Progression status', frameon = False)
+plt.subplots_adjust(wspace = 0.25, hspace = 0.5)
+savefig('tcga_stats')
+plt.show()
+
+#%% TCGA: [plot] good/poor samples per cancer type
 
 df = pd.DataFrame([tcga_dataset.y, tcga_dataset.cancer_type],
                   index = ['Outcome', 'Cancer type']).T
@@ -100,249 +283,202 @@ sns.despine(ax = axes[2], left = True, bottom = False)
 sns.despine(ax = axes[1], left = True, bottom = True)
 axes[2].set_xticks(axes[0].get_xticks())
 axes[0].set_xticks(axes[0].get_xticks())
+savefig('tcga_binary_label_distribution')
 plt.show()
 
-#%% TCGA: load pred proba scores
+#%% TCGA: [calc] performance
 
-base_classifier_names = ['LR', 'MLP', 'RF', 'XGB']
-knn_classifier_name = 'KNN_40'
-other_classifier_names = ['LASSO', 'CMTL', 'CASO']
-path_scores = Path(f'{scores_basedir}/pan_cancer_stratified/')
-model_name = 'MCS'
 
-y, cancer_types = tcga_dataset.y, tcga_dataset.cancer_type
-
-scores_tcga = {}
-test_idx = []
-y_true = []
-
-for fold in range(10):
-    scores_clf = []
-    test_idx_fold = np.loadtxt(f'{path_scores}/TCGA/LR/test_index_fold_{fold}.csv', dtype = int)
-    test_idx.append(test_idx_fold)
-    y_true.append(y[test_idx_fold].ravel())
-    # load scores for MCS and associated baselines
-    for classifier_name in base_classifier_names:
-        p = Path(f'{path_scores}/TCGA/{classifier_name}')
-        score_df = pd.read_csv(f'{p}/scores_fold_{fold}.csv', 
-                               sep = '\t', index_col = 0, header = [0, 1, 2]).T
-        score_df = score_df.loc[(slice(None), slice(None), ['0 (baseline)', 'MCS']), :]
-        score_df.index =  (score_df
-                           .index
-                           .set_levels(score_df
-                                       .index
-                                       .levels[2]
-                                       .str.replace('0 (baseline)', classifier_name)
-                                       .str.replace('MCS', 'MCS-' + classifier_name), level = 2))
-        scores_clf.append(score_df)
-    # load scores for KNN
-    p = Path(f'{path_scores}/TCGA/{knn_classifier_name}')
-    score_df = pd.read_csv(f'{p}/scores_fold_{fold}.csv', sep = '\t', index_col = 0, header = [0, 1, 2]).T
-    score_df.index =  (score_df
-                       .index
-                       .set_levels(score_df.index.levels[2].str.replace('0 (baseline)',
-                                                                        'KNN'), level = 2))
-    scores_clf.append(score_df)
-
-    # load scores for MTL methods
-    for classifier_name in other_classifier_names:
-        for suffix, augmenter_name in zip(['', '_augmented'], ['Baseline', 'CiFRUS']):
-            p = Path(f'{path_scores}/TCGA/{classifier_name}{suffix}')
-            try:
-                score_df = pd.read_csv(f'{p}/scores_fold_{fold}.csv', sep = '\t', index_col = None, header = None).T
-                score_df.index = pd.MultiIndex.from_tuples([(augmenter_name, 'PCA', classifier_name)],
-                                                            names = ['augmentation', 'transformation', None])
-                # Logistic function has to be applied on the scores
-                scores_transformed = (1/(1+np.exp(-score_df.values)))
-                score_df = pd.DataFrame(scores_transformed,
-                                        index = score_df.index, columns = score_df.columns)
-                scores_clf.append(score_df)
-            except FileNotFoundError:
-                print('Could not read file:', str(p))
-        
-    for classifier_name in [clf_name + '+' for clf_name in base_classifier_names]:
-        p = Path(f'{path_scores}/TCGA/{classifier_name}')
-        try:
-            score_df = pd.read_csv(f'{p}/scores_fold_{fold}.csv', sep = '\t', index_col = [0, 1, 2], header = None)
-            score_df.index.names = ['augmentation', 'transformation', None]
-            score_df.columns = np.arange(score_df.shape[1])
-            scores_clf.append(score_df)
-        except FileNotFoundError:
-            print('Could not read file:', str(p))
-
-    scores_clf = pd.concat(scores_clf, axis = 0)
-    scores_clf = scores_clf.reorder_levels([2, 0, 1]).sort_index()
-    scores_clf.index.names = ['classifier'] + scores_clf.index.names[1:]
-    scores_tcga[fold] = scores_clf
-    
-#%% TCGA: performance metrics
-
+basedir = './results_v2'
+path_experiment = Path(basedir, 'pan_cancer_stratified', 'TCGA')
 threshold = 0.25
 
-metrics = {}
-for (fold, score_df), y_true_fold in zip(scores_tcga.items(), y_true):
-    metrics[fold] = scores_to_metrics(score_df, y_true_fold, p_threshold = threshold)
+y_pred = load_y(path_experiment)
+
+# Consolidate folds
+y_pred_combined = get_y_pred_combined(y_pred)
+
+metrics, metrics_mean, metrics_ci = get_performance(y_pred)
+
+# Quick peak
+model_names = metrics_mean.index.levels[-1]
+# Exclude numeric (threshold) entries
+model_names = model_names[model_names.str[0].str.isalpha()]
+idx = (slice(None), slice(None), slice(None), model_names)
+t = metrics_mean.loc[idx, :].droplevel(0)
+
+#%% TCGA: [table] MCS vs base performance
+
+classifier_names = ['KNN', 'LR', 'MLP', 'RF', 'XGB']
+metric_names = ['AUC', 'F1', 'Balanced accuracy']
+classifier_level_values = metrics_mean.index.get_level_values('Classifier')
+
+mask = [any([val.startswith(clf_name) for clf_name in classifier_names]) \
+        for val in classifier_level_values]
+model_idx = (slice(None), slice(None), ['Baseline', 'MCS'])
+
+tables = {'mean': metrics_mean, 'ci': metrics_ci}
+for table_id, table in tables.items():
+    table = (table
+             .loc[mask, metric_names]
+             .droplevel('Transform')
+             .loc[model_idx, :])
+
+    table = table.reset_index()
+    table['Classifier'] = table['Model threshold'].replace(
+        {'Baseline': '', 'MCS': 'MCS-'})\
+        + table['Classifier']
+    table['Sort dummy'] = table['Model threshold'].replace(
+        {'Baseline': '', 'MCS': 'zMCS-'})\
+        + table['Classifier']
+    table['Augment'] = table['Augment'].replace(
+        {'Baseline': '-', 'CiFRUS': 'Yes'})
+    table.pop('Model threshold')
+    table = table.set_index(
+        ['Sort dummy', 'Classifier', 'Augment']).sort_index().droplevel(0)
+    table.columns = table.columns.str.replace('Balanced accuracy', 'Bal. acc.')
+    tables[table_id] = table
     
-metrics = pd.concat(metrics)
-metrics.index.names = ['fold'] + metrics.index.names[1:]
+table_mean = tables['mean']
+table_ci = tables['ci']
 
-# Average and CI calculated over folds
-metrics_mean = metrics.groupby(level = [1, 2, 3]).mean()
-metrics_ci = metrics.groupby(level = [1, 2, 3]).sem() * 1.96
-
-
-#%% TCGA: table (MCS vs base)
-
-classifier_names = ['LR', 'RF', 'XGB']
-metric_names = ['AUC', 'F1', 'Balanced accuracy']
-mask = ~(metrics_mean
-         .index
-         .get_level_values('classifier')
-         .isin(['CASO', 'CMTL']))
-tab_mean = metrics_mean.loc[mask, metric_names].droplevel('transformation')
-tab_ci = metrics_ci.loc[mask, metric_names].droplevel('transformation')
-sort_idx = np.array([[clf_name, clf_name + '+', 'MCS-' + clf_name] for clf_name in classifier_names]).reshape(-1)
-sort_idx = np.insert(sort_idx, 0, 'KNN')
-tab_mean = tab_mean.loc[sort_idx, :]
-tab_ci = tab_ci.loc[sort_idx, :]
-
-tab = highlight_top_two(tab_mean.T, ci = tab_ci.T, precision = 3, ci_precision = 3).T
-tab.to_latex(Path(FIGURE_SAVEDIR, 'pancancer_performance.tex'),
-             index = True,
-             multicolumn_format = 'c',
-             multirow=False,
-             column_format = ('ll' + 'r'*(tab.shape[1])))
-
-#%% TCGA: table (MCS vs MTL)
+table = highlight_top_two(
+    table_mean.T, ci = table_ci.T, precision = 3, ci_precision = 3).T
+table.to_latex(
+    Path(FIGURE_SAVEDIR, 'pancancer_performance.tex'),
+    index = True,
+    multicolumn_format = 'c',
+    multirow=False,
+    column_format = ('ll' + 'r'*(table.shape[1])))
+   
+#%% TCGA: [table] MCS vs MTL performance
 
 metric_names = ['AUC', 'F1', 'Balanced accuracy']
-sort_idx = (['LASSO', 'CASO', 'CMTL', 'MCS-LR', 'MCS-XGB'], 'Baseline')
-tab_mean = metrics_mean.loc[sort_idx, metric_names].droplevel(['augmentation', 'transformation'])
-tab_ci = metrics_ci.loc[sort_idx, metric_names].droplevel(['augmentation', 'transformation'])
-tab = highlight_top_two(tab_mean.T, ci = tab_ci.T,
-                        precision = 3, ci_precision = 2).T
+mtl_classifier_names = ['LASSO', 'CASO', 'CMTL']
+mcs_classifier_names = ['LR', 'XGB']
+
+tables = {'mean': metrics_mean, 'ci': metrics_ci}
+
+for table_id, table in tables.items():
+    table = pd.concat([
+        table.loc[(slice(None), slice(None), mtl_classifier_names)],
+        table.loc[(slice(None), slice(None), mcs_classifier_names, 'MCS')]
+    ], axis = 0)
+    table = table.droplevel(0).reorder_levels([1, 0, 2])
+    table = table[metric_names]
+    table = table.reset_index()
+    table['Model threshold'] = table['Model threshold'].apply(lambda val: '' if val != 'MCS' else val + '-')
+    table['Classifier'] = table['Model threshold'] + table['Classifier']
+    table['Augment'] = table['Augment'].replace(
+        {'Baseline': '-', 'CiFRUS': 'Yes'})
+    table.pop('Model threshold')
+    table = table.set_index(['Classifier', 'Augment']).sort_index()
+    table = table.loc[mtl_classifier_names + \
+            ['MCS-' + clf_name for clf_name in mcs_classifier_names]]
+    tables[table_id] = table
+table_mean = tables['mean']
+table_ci = tables['ci']
+
+table = highlight_top_two(
+    table_mean.T, ci = table_ci.T,
+    precision = 3, ci_precision = 2).T
+
 if WRITE_RESULTS:
-    tab.to_latex(Path(FIGURE_SAVEDIR, 'pancancer_comparison_mtl.tex'),
-                 index = True,
-                 multicolumn_format = 'c',
-                 multirow=False)
-    
-#%% TCGA: updated table (MCS vs MTL with augmentation)
+    table.to_latex(
+        Path(FIGURE_SAVEDIR, 'pancancer_comparison_mtl_with_augmentation.tex'),
+        index = True,
+        multicolumn_format = 'c',
+        multirow=False)
 
+
+#%% TCGA: t-test between baseline and MCS
+
+classifier_names = ['LR', 'MLP', 'RF', 'XGB']
 metric_names = ['AUC', 'F1', 'Balanced accuracy']
-sort_idx = ['LASSO', 'CASO', 'CMTL', 'MCS-LR', 'MCS-XGB']
-tab_mean = metrics_mean.loc[(sort_idx), metric_names].droplevel('transformation')
-tab_ci = metrics_ci.loc[(sort_idx), metric_names].droplevel('transformation')
-tab = highlight_top_two(tab_mean.T, ci = tab_ci.T,
-                        precision = 3, ci_precision = 2).T
-
-if WRITE_RESULTS:
-    tab.to_latex(Path(FIGURE_SAVEDIR, 'pancancer_comparison_mtl_with_augmentation.tex'),
-                 index = True,
-                 multicolumn_format = 'c',
-                 multirow=False)
-    
-#%%% TCGA: t-test between baseline and MCS
-
-classifier_names = ['LR', 'RF', 'XGB']
 
 significance = {}
 for clf_name in classifier_names:
     
     df = (metrics
-          .loc[(slice(None), [clf_name, 'MCS-'+clf_name]), :]
-          .droplevel(-1)
-          .unstack(level = -1)
-          .reorder_levels([1, 0])
-          .T)
+          .loc[(slice(None), slice(None), clf_name, ['Baseline', 'MCS']),
+               metric_names]
+          .droplevel([0, 2])
+          .stack()
+          .unstack(level = 'Model threshold')
+          .reorder_levels(['Metric', 'Augment', 'Fold'])
+          .sort_index())
+
     pval_clf = pd.DataFrame(np.nan,
-                            index = df.index,
+                            index = pd.MultiIndex.from_product([
+                                metric_names, df.index.levels[1]]),
                             columns = ['tval', 'pval'])
-    for idx in df.index.values:
-        df_idx = df.loc[idx, ]
-        pval_clf.loc[idx, :] = list(ttest_rel(
-            df_idx.loc['MCS-'+clf_name].sort_index().values,
-            df_idx.loc[clf_name].sort_index().values))
-        
+    pval_clf.index.names = ['Metric', 'Augment']
+    for cfg in pval_clf.index.values:
+        pval_clf.loc[cfg, :] = list(ttest_rel(
+            df.loc[cfg]['MCS'].sort_index(),
+            df.loc[cfg]['Baseline'].sort_index()))
     significance[clf_name] = pval_clf
-significance = pd.concat(significance)
+significance = pd.concat(significance).round(3)
+
 count = pd.crosstab(significance['tval'] > 0, significance['pval'] <= 0.05)
-count.index.names = ['t > 0']
-count.columns.names = ['p <= 0.05']
+count.index.names = ['MCS is better (t > 0)']
+count.columns.names = ['Significant (p <= 0.05)']
 print(count.stack().reset_index())
 
-#%% TCGA: subtask performance
+#%% TCGA: [calc] subtask performance
 
-base_classifier_names = ['LR', 'MLP', 'RF', 'XGB']
-knn_classifier_name = 'KNN_40'
-other_classifier_names = ['LASSO', 'CMTL', 'CASO']
-path_scores = Path(f'{results_basedir}/pred_probability/pan_cancer_stratified/')
-model_name = 'MCS'
 threshold = 0.25
 
-y, cancer_types = tcga_dataset.y, tcga_dataset.cancer_type
-
-scores_tcga = {}
-
-test_idx = []
-scores_fold = {}
-for fold in range(10):
-    scores_clf = {}
-    test_idx.append(np.loadtxt(f'{path_scores}/TCGA/LR/test_index_fold_{fold}.csv', dtype = int))
-    # load scores for MCS
-    for classifier_name in base_classifier_names:
-        p = Path(f'{path_scores}/TCGA/{classifier_name}')
-        score_df = pd.read_csv(f'{p}/scores_fold_{fold}.csv', 
-                               sep = '\t', index_col = 0, header = [0, 1, 2]).T
-        scores_clf[f'{classifier_name}'] = score_df.loc[('Baseline', 'PCA', '0 (baseline)'), :].rename(f'{classifier_name}')
-        scores_clf[f'MCS-{classifier_name}'] = score_df.loc[('Baseline', 'PCA', 'MCS'), :].rename(f'MCS-{classifier_name}')
-    # load scores for KNN
-    p = Path(f'{path_scores}/TCGA/{knn_classifier_name}')
-    score_df = pd.read_csv(f'{p}/scores_fold_{fold}.csv', sep = '\t', index_col = 0, header = [0, 1, 2])
-    scores_clf[knn_classifier_name.split('_')[0]] = score_df.loc[:, ('Baseline', 'PCA', '0 (baseline)')].rename(knn_classifier_name.split('_')[0])
-    # load scores for MTL methods
-    for classifier_name in other_classifier_names:
-        p = Path(f'{path_scores}/TCGA/{classifier_name}')
-        score_df = pd.read_csv(f'{p}/scores_fold_{fold}.csv', sep = '\t', index_col = None, header = None).squeeze()
-        
-        # Logistic function has to be applied on the scores
-        scores_transformed = 1/(1+np.exp(-score_df.values))
-        score_df = pd.Series(scores_transformed,
-                             index = score_df.index)
-        scores_clf[classifier_name] = score_df
-            
-    scores_fold[fold] = pd.concat(scores_clf, axis = 1)
-test_idx = np.concatenate(test_idx)
-scores_fold = pd.concat(scores_fold).reset_index(drop = True).T
-scores_fold = scores_fold.iloc[:, np.argsort(test_idx)]
-
 metrics_tcga_types = {}
-for cancer_type in np.unique(cancer_types):
-    mask = (cancer_types == cancer_type)
-    y_true_cancer_type = y[mask]
-    m = scores_to_metrics(scores_fold.loc[:, mask], y_true_cancer_type, p_threshold = threshold)
-    m = m.sort_index()
-    metrics_tcga_types[cancer_type] = m
+for (transform_name, augment_name), y_pred_cfg in y_pred_combined.items():
+    
+    metrics_cfg = {}
+    for cancer_type, y_pred_ctype in y_pred_cfg.groupby('ctypes'):
+        y_true_ctype = y_pred_ctype.pop('y_true')
+        _ = y_pred_ctype.pop('ctypes')
+        metrics_ctype = scores_to_metrics(
+            y_pred_ctype.T, y_true_ctype, p_threshold = threshold)
+        
+        mask = [('-' in colname) \
+                and ('Baseline' not in colname.split('-')) \
+                and ('MCS' not in colname.split('-')) \
+                    for colname in metrics_ctype.index]
+        metrics_ctype = metrics_ctype.loc[~np.array(mask), :]
+        metrics_ctype.index = metrics_ctype.index.map(lambda name: name.replace('-Baseline', ''))
+        metrics_cfg[cancer_type] = metrics_ctype
+    metrics_cfg = pd.concat(metrics_cfg)
+    metrics_tcga_types[(transform_name, augment_name)] = metrics_cfg
+metrics_tcga_types = pd.concat(metrics_tcga_types)
+metrics_tcga_types.index.names = ['Transform', 'Augment', 'Cancer type', 'Model']
+metrics_tcga_types.columns.name = 'Metric'
 
-metrics_tcga_types = pd.concat(metrics_tcga_types, axis = 0)
-metrics_tcga_types.index.names = ['Cancer type', 'Model']
+#%%% Plot
 
-#%% -- Plot
-
+transform_name = 'PCA'
+augment_name = 'Baseline'
 metric_names = ['AUC', 'F1', 'Balanced accuracy']
-fig, axes = plt.subplots(nrows = 2, ncols = len(metric_names), 
-                        figsize = (5.8*len(metric_names), 10),
-                        sharex = True, sharey = False, squeeze = False,
-                        gridspec_kw = {'height_ratios': [27, 1],
-                                       'wspace': 0.03, 'hspace': 0.03})
+
+base_classifier_names = ['LR', 'MLP', 'RF', 'XGB']
+mtl_classifier_names = ['LASSO', 'CMTL', 'CASO']
+knn_classifier_name = 'KNN'
+
+fig, axes = plt.subplots(
+    nrows = 2, ncols = len(metric_names), 
+                    figsize = (6*len(metric_names), 10),
+                    sharex = True, sharey = False, squeeze = False,
+                    gridspec_kw = {'height_ratios': [27, 1],
+                                   'wspace': 0.03, 'hspace': 0.03})
+available_clf_names = metrics_tcga_types.index.unique(level='Model')
 classifier_order = base_classifier_names \
-                   + [knn_classifier_name.split('_')[0]] \
-                   + other_classifier_names \
+                   + ([knn_classifier_name.split('_')[0]] \
+                      if knn_classifier_name in available_clf_names else []) \
+                   + [clf_name for clf_name in mtl_classifier_names \
+                      if clf_name in available_clf_names] \
                    + ['MCS-'+ clf_name for clf_name in base_classifier_names]
 for i, metric_name in enumerate(metric_names):
-    m = metrics_tcga_types[metric_name].unstack(level = -1)
+    m = metrics_tcga_types.loc[
+        (transform_name, augment_name), metric_name].unstack(level = 'Model')
     m = m[classifier_order]
-    #annot = m.T.apply(lambda row: [f'*{val:.2f}' if val == row.max() else f' {val:.2f}' for val in row]).T
     annot = m.map(lambda val: f'{val:.2f}')
     best_non_mcs = m.loc[:, ~m.columns.str.startswith('MCS')].max(axis = 1)
     for colname in m.columns[m.columns.str.startswith('MCS')]:
@@ -358,86 +494,113 @@ for i, metric_name in enumerate(metric_names):
     
     ax = axes[0, i]
     
-    sns.heatmap(data = m, 
-                annot = annot, fmt = 's', ax = ax, cbar = False,
-                vmin = 0.3, vmax = 0.9)
+    sns.heatmap(
+        data = m, 
+        annot = annot, fmt = 's', ax = ax, cbar = False,
+        vmin = 0.3, vmax = 0.9)
     
     if ax != axes[0, 0]:
         ax.set_ylabel('')
         ax.set_yticks([])
-    ax.set_title(metric_name)
+    if len(metric_names) > 1:
+        ax.set_title(metric_name)
     ax.set_xticks([])
     ax.set_xlabel('')
     
     ax = axes[1, i]
-    # sns.heatmap(count_wins, ax = ax,
-    #             annot = True, fmt = 'd', cmap = 'Blues', 
-    #             vmin = 0, vmax = len(df), cbar = False)
-    sns.heatmap(mean_rank, ax = ax,
-                annot = True, fmt = '.2f', cmap = 'Blues', 
-                vmin = 1, vmax = rank.shape[1], cbar = False)
+
+    sns.heatmap(
+        mean_rank, ax = ax,
+        annot = True, fmt = '.2f', cmap = 'Blues', 
+        vmin = 1, vmax = rank.shape[1], cbar = False)
     ax.set_yticklabels(ax.get_yticklabels(), rotation = 0)
-    ax.set_xticklabels(ax.get_xticklabels(), rotation = 45)
+    ax.set_xticklabels(ax.get_xticklabels(), rotation = 40, ha = 'right')
     if ax != axes[1, 0]:
         ax.set_yticklabels([])
     ax.set_xlabel('')
 plt.subplots_adjust(wspace = 0.05)
-savefig('tcga_subtask_metrics')
+title_suffix = ''
+if len(metric_names) == 1:
+    title_suffix = '_' + metric_names[0].replace(' ', '_')
+savefig('tcga_subtask_metrics' + title_suffix)
 plt.show()
 
-#%% Single-cancer: load pred proba scores
+
+#%% Single-cancer: [calc] performance metrics
 
 classifier_names = ['LR', 'RF', 'XGB']
 threshold = 0.25
-path_scores = Path(f'{scores_basedir}/single_cancer/')
-model_name = 'MCS'
+basedir = './results_v2'
+path_experiment = Path(basedir, 'single_cancer')
 
-metrics_single = {}
-for (dataset_name, ds_obj) in load_single_cancer_datasets():
-    y = ds_obj.y
-    for classifier_name in classifier_names:
-        p = Path(f'{path_scores}/{dataset_name}/{classifier_name}')
-        test_idx = []
-        scores_fold = {}
-        for fold in range(10):
-            score_df = pd.read_csv(f'{p}/scores_fold_{fold}.csv', 
-                                   sep = '\t', index_col = 0, header = [0, 1, 2]).T
-            scores_fold[fold] = score_df
-            test_idx.append(np.loadtxt(f'{p}/test_index_fold_{fold}.csv', dtype = int))
-        scores_fold = pd.concat(scores_fold, axis = 1)
-        test_idx = np.concatenate(test_idx)
-        scores_fold = scores_fold.iloc[:, np.argsort(test_idx)]
-        
-        metric_df = scores_to_metrics(scores_fold, y, p_threshold = threshold)
-        m = metric_df.loc[(slice(None), slice(None), ['0 (baseline)', model_name]), :].droplevel(1, axis = 0)
-        metrics_single[(classifier_name, dataset_name)] = m
-metrics_single = pd.concat(metrics_single)
-metrics_single.index.names = ['Classifier', 'Dataset', 'Augmentation', 'Model']
-metrics_single = metrics_single.reset_index()
-metrics_single['Model'] = metrics_single['Model'].apply(lambda val: 'Baseline' if 'baseline' in val.lower() else val)
-metrics_single = metrics_single.set_index(['Classifier', 'Dataset', 'Augmentation', 'Model'])
+dirnames = np.array([d for d in path_experiment.iterdir() if d.is_dir()])
 
-#%% -- Plot
+y_pred_single_cancer = {}
 
+for dirname in dirnames:
+    dataset_name = dirname.name
+    y_pred_dataset = load_y(dirname)
+    for k, v in y_pred_dataset.items():
+        y_pred_single_cancer[(dataset_name, *k)] = v.drop('ctypes', axis = 1)
+
+metrics_single_cancer = {}
+
+for config, y_pred_df in y_pred_single_cancer.items():
+    y_true_cfg = y_pred_df['y_true']
+    y_pred_df = y_pred_df.drop('y_true', axis = 1)
+    metrics_single_cancer[config] = scores_to_metrics(
+        y_pred_df.T, y_true_cfg, p_threshold = threshold)
+metrics_single_cancer = pd.concat(metrics_single_cancer)
+
+metrics_single_cancer.index.names = [
+    'Dataset', 'Transform', 'Augment', 'Classifier', 'Fold', 'Model']
+metrics_single_cancer = metrics_single_cancer.reorder_levels([
+    'Classifier', 'Dataset', 'Augment', 'Transform', 'Model', 'Fold']).sort_index()
+
+metrics_single_cancer.columns.name = 'Metric'
+
+metrics_single_cancer_mean = metrics_single_cancer.groupby(level = [
+    'Classifier', 'Dataset', 'Augment', 'Transform', 'Model']).mean().sort_index()
+metrics_single_cancer_ci = metrics_single_cancer.groupby(level = [
+    'Classifier', 'Dataset', 'Augment', 'Transform', 'Model']).sem().sort_index() * 1.96
+
+# Quick peak
+model_names = metrics_single_cancer_mean.index.levels[-1]
+# Exclude numeric (threshold) entries
+model_names = model_names[model_names.str[0].str.isalpha()]
+idx = (slice(None), slice(None), slice(None), slice(None), model_names)
+t = metrics_single_cancer_mean.loc[idx, :]
+
+#%%% Plot
+
+classifier_names = ['RF', 'XGB']
 metric_names = ['AUC', 'F1', 'Balanced accuracy']
 augmentation_name = 'Baseline'
+transform_name = 'PCA'
 
+fig, axes = plt.subplots(
+    nrows = len(metric_names),
+    ncols = metrics_single_cancer_mean.index.levshape[0],
+    figsize = (6*len(metric_names), 2*metrics_single_cancer_mean.index.levshape[0]),
+    sharex = True)
 
-fig, axes = plt.subplots(nrows = len(metric_names), ncols = metrics_single.index.levshape[0],
-                         figsize = (6*len(metric_names), 2*metrics_single.index.levshape[0]), sharex = True)
-
-data =  metrics_single.loc[(slice(None), slice(None), augmentation_name), metric_names]
+data =  (metrics_single_cancer_mean
+         .loc[(slice(None), slice(None), augmentation_name,
+              transform_name, ['Baseline', 'MCS']),
+              metric_names]
+         .droplevel(['Augment', 'Transform']))
 stats = pd.DataFrame(0, index = data.index.levels[0], columns = data.columns)
-data = data.reset_index()
-data['Dataset'] = data['Dataset'].str.replace('_', '-')
-data = data.set_index(['Classifier', 'Dataset', 'Augmentation', 'Model']).sort_index()
-data = data.droplevel(2)
+
 for i, metric_name in enumerate(metric_names):
     for j, classifier_name in enumerate(data.index.levels[0]):
         ax = axes[i, j]
         df = data.loc[classifier_name, metric_name].reset_index()
-        sns.barplot(data = df, x = 'Dataset', y = metric_name,
-                    hue = 'Model', ax = ax)
+        sns.barplot(
+            data = df, x = 'Dataset', 
+            y = metric_name,
+            hue = 'Model',
+            ax = ax)
+        
         # add marker for bars where MCS outperforms baseline
         df = data.loc[classifier_name, metric_name].unstack(level = -1)
         df = df.sort_index()
@@ -467,7 +630,7 @@ for i, metric_name in enumerate(metric_names):
         ax.legend(loc = 'upper left', bbox_to_anchor = [1, 1], ncols = 1, frameon = False)
         if ax != axes[0, -1]:
             ax.legend().remove()
-
+        
 fig.add_subplot(111, frameon=False)
 plt.tick_params(labelcolor='none', which='both', top=False, bottom=False, left=False, right=False)
 plt.xlabel("Dataset", labelpad = 60)        
@@ -476,95 +639,106 @@ plt.subplots_adjust(hspace = 0.1)
 savefig('single_cancer_metrics')
 plt.show()
 
-
+stats.columns = stats.columns.str.replace('Balanced accuracy', 'Bal. acc.')
 stats_total = pd.DataFrame(data.index.levshape[1], index = stats.index, columns = stats.columns)
 stats_total['All'] = stats_total.sum(axis = 1)
 stats_total.loc['All', :] = stats_total.sum(axis = 0)
 stats['All'] = stats.sum(axis = 1)
 stats.loc['All', :] = stats.sum(axis = 0)
 stats = stats.astype(int)
-print('==========\nStats\n==========')
+
+print('='*60 + '\nStats\n' + '='*60)
 print('Number/Total (%) of datasets where MCS outperforms Baseline:')
 print(stats.astype(str) \
        + '/' + stats_total.astype(int).astype(str) \
        + ' (' + (stats * 100 / stats_total).round(1).astype(str) + '%)')
+    
+#%% TCGA: Performance comparison between MCS and component models
 
-#%% TCGA: ablation
 
-classifier_names = ['RF', 'XGB']
 threshold = 0.25
 
-basepath = f'{scores_basedir}/pan_cancer_stratified/TCGA'
-y = tcga_dataset.y
 metrics_ablation = {}
-
-for classifier_name in classifier_names:
-    p = Path(f'{basepath}/{classifier_name}')
-    test_idx = []
-    metrics_fold = {}
-    for fold in range(10):
-        score_df = pd.read_csv(f'{p}/scores_fold_{fold}.csv', 
-                               sep = '\t', index_col = 0, header = [0, 1, 2]).T
-        # drop the "transfomation" level as the only value for TCGA dataset is "PCA"
-        score_df = score_df.droplevel(1)
-        score_df.index.names = ['Augmentation', 'Threshold']
-        score_df = score_df.reset_index()
-        score_df['Threshold'] = score_df['Threshold'].apply(lambda val: val.replace('(baseline)', '(base)'))
-        score_df = score_df.set_index(['Augmentation', 'Threshold'])
-        score_df = score_df.sort_index()
-        score_df = score_df.loc[~score_df
-                                .index
-                                .get_level_values(-1).isin(['MCS']), :]
-        # cumulative average of different thresholds
-        score_df_cumulative = score_df.groupby(level = 0).expanding().mean().droplevel(0)
-        score_df = pd.concat({'Single': score_df, 'Cumulative': score_df_cumulative})
-        score_df = score_df.reorder_levels([1, 2, 0])
-        score_df.index.names = np.hstack([score_df.index.names[:-1], ['Aggregation']])
-        score_df = score_df.sort_index()
-        test_idx = np.loadtxt(f'{p}/test_index_fold_{fold}.csv', dtype = int)
-        y_fold = y[test_idx]
-        metrics_fold[fold] = scores_to_metrics(score_df, y_fold, p_threshold = threshold)
-        
-    metrics_fold = pd.concat(metrics_fold, axis = 0)
-    metrics_fold.index.names = ['Fold', 'Augmentation', 'Threshold', 'Aggregation']
-    metrics_fold_mean = metrics_fold.groupby(level = [1, 2, 3]).mean()
-    metrics_fold_sem = metrics_fold.groupby(level = [1, 2, 3]).sem()
-    metrics_ablation[classifier_name] = metrics_fold
-    
+metrics_ttest = {}
+for config, y_pred_df in y_pred.items():
+    if 'MCS' not in y_pred_df.columns:
+        continue
+    y_true_cfg = y_pred_df['y_true']
+    y_pred_df = y_pred_df.drop(['y_true', 'ctypes'], axis = 1)
+    metrics_cfg = scores_to_metrics(
+        y_pred_df.T, y_true_cfg, p_threshold = threshold)
+    metrics_ttest[config] = metrics_cfg.T
+    y_pred_df = y_pred_df.drop('MCS', axis = 1).T
+    metrics_ablation[tuple(list(config) + ['Individual'])] = scores_to_metrics(
+        y_pred_df, y_true_cfg, p_threshold = threshold)
+    metrics_ablation[tuple(list(config) + ['Cumulative'])] = scores_to_metrics(
+        y_pred_df.expanding().mean(), y_true_cfg, p_threshold = threshold)
 metrics_ablation = pd.concat(metrics_ablation)
-metrics_ablation.index.names = np.hstack([['Base classifier'], metrics_ablation.index.names[1:]])
-    
-#%% -- Plot
+
+metrics_ablation.index.names = [
+    'Transform', 'Augment', 'Classifier', 'Fold', 'Probability aggregation', 'Threshold']
+metrics_ablation = metrics_ablation.reorder_levels([0, 1, 2, 5, 4, 3]).sort_index()
+metrics_ablation.columns.name = 'Metric'
+
+metrics_ablation_mean = metrics_ablation.groupby(level = [
+    'Transform', 'Augment', 'Classifier', 'Probability aggregation', 'Threshold']).mean()
+metrics_ablation_ci = metrics_ablation.groupby(level = [
+    'Transform', 'Augment', 'Classifier', 'Probability aggregation', 'Threshold']).sem() * 1.96
+metrics_ttest = pd.concat(metrics_ttest)
+metrics_ttest.index.names = ['Transform', 'Augment', 'Classifier', 'Fold', 'Metric']
+
+# t-test
+
+ttest_results = {}
+for cfg, metrics_cfg in metrics_ttest.groupby(['Transform', 'Augment', 'Classifier', 'Metric']):
+    ttest_res_cfg = {}
+    for colname in metrics_cfg.columns:
+        if colname == 'MCS':
+            continue
+        ttest_res_cfg[colname] = ttest_rel(metrics_cfg['MCS'], metrics_cfg[colname], )[:2]
+    ttest_res_cfg = pd.DataFrame(ttest_res_cfg).T
+    ttest_res_cfg.columns = ['t-val', 'p-val']
+    ttest_results[cfg] = ttest_res_cfg
+ttest_results = pd.concat(ttest_results)
+ttest_results.index.names = ['Transform', 'Augment', 'Classifier', 'Metric', 'Model']
+
+#%%% Plot
 
 metric_names = ['AUC', 'F1', 'Balanced accuracy']
-augmentation_name = 'Baseline'
+transform_name = 'PCA'
+augment_name = 'CiFRUS'
+classifier_names = ['RF', 'XGB']
 
-ncols = metrics_ablation.index.levshape[0]
+ncols = len(classifier_names)
 nrows = len(metric_names)
-fig, axes = plt.subplots(ncols = ncols, nrows = nrows, figsize = (2*ncols, 2*nrows),
+fig, axes = plt.subplots(ncols = ncols, nrows = nrows, figsize = (2*ncols, 1.5*nrows),
                          sharex = True, sharey = True)
 for i, metric_name in enumerate(metric_names):
-    for j, classifier_name in enumerate(metrics_ablation.index.levels[0]):
+    for j, classifier_name in enumerate(classifier_names):
         ax = axes[i, j]
-        t = metrics_ablation.loc[(classifier_name, slice(None), augmentation_name),
+        t = metrics_ablation.loc[(transform_name, augment_name, classifier_name),
                                  metric_name].reset_index()
-        
-        data = t[t['Aggregation'] == 'Cumulative']
-        sns.lineplot(data = data, x = 'Threshold', y = metric_name,
-                     linestyle = '--', hue = 'Aggregation', palette = {'Cumulative': 'C1'},
-                     errorbar = ('ci', 95), err_style = 'bars', err_kws = {'capsize': 1},
-                     ax = ax)
-        data = t[t['Aggregation'] == 'Single']
-        sns.lineplot(data = data, x = 'Threshold', y = metric_name,
-                     linestyle = ' ', markers=True, marker = 'o', hue = 'Aggregation',
-                     errorbar = ('ci', 95), err_style = 'bars', err_kws = {'capsize': 1},
-                     ax = ax)
+        t['Threshold'] = t['Threshold'].replace({'Baseline': '0 (Baseline)'})
+        t = t.sort_values('Threshold')
+        data = t[t['Probability aggregation'] == 'Cumulative']
+        sns.lineplot(
+            data = data, x = 'Threshold', y = metric_name,
+            linestyle = '--', hue = 'Probability aggregation', palette = {'Cumulative': 'C1'},
+            errorbar = ('ci', 95), err_style = 'bars', err_kws = {'capsize': 1},
+            ax = ax)
+        data = t[t['Probability aggregation'] == 'Individual']
+        sns.lineplot(
+            data = data, x = 'Threshold', y = metric_name,
+            linestyle = ' ', markers=True, marker = 'o', hue = 'Probability aggregation',
+            errorbar = ('ci', 95), err_style = 'bars', err_kws = {'capsize': 1},
+            ax = ax)
         ax.set_xlabel('')
+        ax.set_ylabel(ax.get_ylabel().replace('Balanced accuracy', 'Bal. acc.'))
         if i == 0:
-            ax.set_title(f'Classifier: {classifier_name}')
+            ax.set_title(f'{classifier_name}')
         if j != 0:
             ax.set_ylabel('')
-        
+   
         ax.set_ylim(0.45, 0.75)
         ax.legend(loc = 'upper left', bbox_to_anchor = [1, 1], title = 'Score\nAggregation')
         if ax != axes[0, -1]:
@@ -576,121 +750,367 @@ for i, metric_name in enumerate(metric_names):
         ax.grid(color = '#CCC')
 fig.add_subplot(111, frameon=False)
 plt.tick_params(labelcolor='none', which='both', top=False, bottom=False, left=False, right=False)
-plt.xlabel("Correlation threshold", labelpad = 30)
-plt.subplots_adjust(wspace = 0.1, hspace = 0.1)
+plt.xlabel("Correlation threshold percentile", labelpad = 40)
+plt.subplots_adjust(wspace = 0.15, hspace = 0.1)
 savefig('tcga_ablation')
 plt.show()
 
+# t-test results
 
+df = (ttest_results
+      .loc[(transform_name, augment_name), :]
+      .loc[(classifier_names, metric_names), :])
+is_significant = (df['t-val'] > 0) & (df['p-val'] <= 0.05)
+is_significant = is_significant.unstack(level = -2)
+print(is_significant)
 
-#%% TCGA: Performance vs correlation
+#%% TCGA: performance for different similarity metrics
 
-classifier_names = ['RF', 'XGB']
 metric_names = ['AUC', 'F1', 'Balanced accuracy']
-h = 0.15
-n_bins = 3
-path_scores = Path(f'{scores_basedir}/pan_cancer_stratified/')
+
+basedir = './results_v2/ablation'
+dirnames = np.array([d for d in Path(basedir).iterdir() if d.is_dir()])
+metrics_similarity_mean = {}
+metrics_similarity_ci = {}
+filter_idx = ('PCA', 'Baseline', slice(None), 'MCS')
+for dirname in dirnames:
+    metric_name = dirname.name.capitalize().replace('_signed', ' (signed)')
+    y_pred_metric = load_y(Path(dirname, 'pan_cancer_stratified', 'TCGA'))
+    _, df_mean, df_ci = get_performance(y_pred_metric)
+    
+    df_mean = df_mean.loc[filter_idx]
+    df_ci = df_ci.loc[filter_idx]
+    metrics_similarity_mean[metric_name] = df_mean
+    metrics_similarity_ci[metric_name] = df_ci
+    
+lower_idx = df_mean.index
+
+# Add the default (Pearson) from previously loaded results
+metrics_similarity_mean['Pearson'] = (metrics_mean
+                                      .loc[filter_idx]
+                                      .loc[lower_idx, :])
+metrics_similarity_ci['Pearson'] = (metrics_ci
+                                    .loc[filter_idx]
+                                    .loc[lower_idx, :])
+
+metrics_dict = {'mean': metrics_similarity_mean,
+                'ci': metrics_similarity_ci}
+for k, df in metrics_dict.items():
+    df = pd.concat(df)
+    df.index.names = ['Distance'] + list(df.index.names)[1:]
+    df = df.reorder_levels([1, 0]).sort_index()
+    metrics_dict[k] = df
+metrics_similarity_mean = metrics_dict['mean']
+metrics_similarity_ci = metrics_dict['ci']
+
+#%% TCGA [load] runtimes
+
+basedir = './results_reworked'
+runtime_dir = 'training_times'
+transform_name = 'PCA'
+augment_name = 'Baseline'
+classifier_names = ['RF', 'XGB']
+
+path_experiment = Path(basedir, 'pan_cancer_stratified', 'TCGA')
+
+t_model = {}
+t_similar_sample = {}
+
+for classifier_name in classifier_names:
+    path_runtime_clf = Path(
+        path_experiment, 'training_times',
+        transform_name, augment_name, classifier_name)
+    for path_fold in sorted(list([d for d in path_runtime_clf.iterdir() if d.is_dir()])):
+        fold_dirname = path_fold.name
+        print(classifier_name, '\t', fold_dirname)
+        fold_val = int(fold_dirname.split('fold_')[-1])
+        t_baseline_train = float(np.loadtxt(Path(path_fold, 'runtime_baseline_train.txt')))
+        t_baseline_predict = float(np.loadtxt(Path(path_fold, 'runtime_baseline_predict.txt')))
+        t_model[(classifier_name, fold_val, 'train')] = t_baseline_train
+        t_model[(classifier_name, fold_val, 'predict')] = t_baseline_predict
+        
+        for path_sample in sorted(list(path_fold.glob('*runtime_mcs_predict_sample*'))):
+            sample_id = path_sample.stem.split('_')[-1]
+            t_mcs_predict = float(np.loadtxt(path_sample))
+            t_model[(classifier_name, fold_val, f'mcs-predict-{sample_id}')] = t_mcs_predict
+            
+            path_local_samples = Path(
+                path_experiment, 'data', transform_name, augment_name,
+                fold_dirname, 'runtime_local_set')
+            
+            similar_sample_idx = (fold_val, sample_id)
+            if similar_sample_idx in t_similar_sample:
+                continue
+            t_local_samples = {}
+            for p_local_samples in path_local_samples.rglob(f'*runtime_local_set_sample_{sample_id}.csv'):
+                h_label = p_local_samples.parent.name
+                t_local_samples[h_label] = float(np.loadtxt(p_local_samples))
+            t_similar_sample[similar_sample_idx] = pd.Series(t_local_samples)
+          
+t_model = pd.Series(t_model)
+t_baseline_train = t_model.loc[(slice(None), slice(None), 'train')].reset_index()
+t_baseline_train.columns = ['Base classifier', 'Fold', 'Time']
+t_baseline_predict = t_model.loc[(slice(None), slice(None), 'predict')].reset_index()
+t_baseline_predict.columns = t_baseline_train.columns
+t_mcs_predict = t_model.loc[t_model.index.get_level_values(-1).str.startswith('mcs')].reset_index()
+t_mcs_predict.columns = ['Base classifier', 'Fold', 'Sample', 'Time']
+t_mcs_predict['Sample'] = t_mcs_predict['Sample'].str.split('-').str[-1].astype(int)
+t_similar_sample = pd.concat(t_similar_sample).reset_index()
+t_similar_sample.columns = ['Fold', 'Sample', 'h', 'Time']
+
+#%%% Plot
+
+fig, axes = plt.subplots(
+    nrows = 1, ncols = 4, sharey = True,
+    figsize = (5, 2),
+    gridspec_kw = {'width_ratios': [5, 1, 5, 5]})
+
+# Plot baseline train
+ax = axes[0]
+sns.barplot(
+    data = t_baseline_train, y = 'Time',
+    hue = 'Base classifier', hue_order = classifier_names,
+    ax = ax, legend = False)
+ax.set_xlabel('Train\nglobal model')
+ax.set_title('Traning')
+ax.set_ylabel('Time (seconds)')
+
+axes[1].axis('off')
+
+# Plot sample selection
+ax = axes[2]
+sns.barplot(
+    data = (t_similar_sample
+            .groupby(['Sample'])['Time']
+            .sum()
+            .reset_index()),
+    y = 'Time',
+    ax = ax,
+    width = 0.4,
+    color = 'C2')
+ax.set_xlim(axes[0].get_xlim())
+ax.set_xlabel('Find similar\nsamples')
+
+# Plot MCS prediction
+ax = axes[3]
+sns.barplot(
+    data = t_mcs_predict, y = 'Time',
+    hue = 'Base classifier', hue_order = classifier_names,
+    ax = ax)
+ax.set_xlabel('Train\nlocal models')
+
+gs = fig.add_gridspec(1, 4, width_ratios = [5, 1, 5, 5])
+fig.add_subplot(gs[:, 2:], frameon = False)
+#fig.add_subplot(132, frameon=True)
+plt.tick_params(labelcolor='none', which='both', top=False, bottom=False, left=False, right=False)
+plt.title('Inference (6 local models)')
+
+axes[3].legend(loc = 'upper left', bbox_to_anchor = [1, 1], title = 'Classifier')
+
+savefig('runtimes')
+plt.show()
+
+#%% TCGA [load] h-thresholds
+
+basepath = './results_v2/pan_cancer_stratified'
+h_paths = Path(basepath).rglob('*H.csv')
+
+H = {}
+for h_path in h_paths:
+    fold = int(h_path.parent.name.split('_')[-1])
+    # Thresholds are determined from pre-augmentation data.
+    # Augmentation does not affect thresholds, kept in config for completeness.
+    augment_name = h_path.parts[-3]
+    transform_name = h_path.parts[-4]
+    dataset_name = h_path.parts[-6]
+    H_cfg = pd.read_csv(h_path, header = None, sep = '\t')
+    H_cfg.columns = ['h_label', 'h_value']
+    H_cfg = H_cfg.set_index('h_label', drop = True)
+    H[(dataset_name, transform_name, augment_name, fold)] = H_cfg
+H = pd.concat(H)
+H.index.names = ['Dataset', 'Transform', 'Augment', 'Fold', 'h_label']
+
+#%%% Plot
 
 dataset_name = 'TCGA'
+transform_name = 'PCA'
+augment_name = 'Baseline'
+
+df = H.loc[(dataset_name, transform_name, augment_name), :].reset_index()
+sns.boxplot(data = df, x = 'h_label', y = 'h_value')
+plt.xlabel('Similarity threshold percentile')
+plt.ylabel('Similarity threshold value')
+plt.show()
+
+#%% TCGA: [calc] pairwise similarity and dataset-wise similarity thresholds
+
+dataset_name = 'TCGA'
+similarity_metric = 'pearson'
+use_absolute_percentiles = True
+#threshold_selector = FixedThresholdSelector(
+#    H = np.arange(0.15, 0.25+0.025, 0.025).round(3)),
+threshold_selector = PercentileThresholdSelector(
+    65, 90, 6, similarity_metric, use_absolute_similarity = True)
+
 X = tcga_dataset.X
 y = tcga_dataset.y
 ctypes = tcga_dataset.cancer_type
-Xt = PCA(n_components = 0.95).fit_transform(X)
-corr = np.corrcoef(Xt)
+Xt = PCA(n_components = 0.95).fit_transform(tcga_dataset.X)
+if similarity_metric == 'pearson':
+    corr = np.corrcoef(Xt)
+elif similarity_metric == 'spearman':
+    corr = spearmanr(Xt)[0]
+# Set diagonal to zero to avoid counting self-loops
+np.fill_diagonal(corr, 0)
 corr_flat = squareform(corr, checks = False)
-y_pred_all = {}
-for classifier_name in classifier_names:
-    p = Path(f'{path_scores}/{dataset_name}/{classifier_name}')
-    test_idx = []
-    scores_fold = {}
-    for fold in range(10):
-        score_df = pd.read_csv(f'{p}/scores_fold_{fold}.csv', 
-                               sep = '\t', index_col = 0, header = [0, 1, 2]).T
-        scores_fold[fold] = score_df
-        test_idx.append(np.loadtxt(f'{p}/test_index_fold_{fold}.csv', dtype = int))
-    scores_fold = pd.concat(scores_fold, axis = 1)
-    test_idx = np.concatenate(test_idx)
-    scores_fold = scores_fold.iloc[:, np.argsort(test_idx)]
-    y_pred = scores_fold.loc[('Baseline', slice(None), ['0 (baseline)', 'MCS']), :].T
-    y_pred = y_pred.droplevel([0, 1], axis = 1).droplevel(1, axis = 0)
-    y_pred.columns = ['Baseline', 'MCS']
-    y_pred = y_pred.reset_index(drop = True)
-    y_pred_all[classifier_name] = y_pred
-y_pred_all = pd.concat(y_pred_all, axis = 1)
-  
-H = list(scores_fold.index.levels[-1])
-H = np.array([float(val) for val in H if 'baseline' not in val and 'MCS' not in val])
+H = threshold_selector.get_thresholds(Xt, as_series = True)
+del Xt
 
-n_correlated= (np.abs(corr) >= h).sum(axis = 1) - 1
-n_correlated = pd.DataFrame(n_correlated, columns = ['# samples'])
-n_correlated['median abs corr'] = np.median(np.abs(corr), axis = 1).ravel()
+# Determine similarity percentiles
 
-n_correlated_binned = pd.qcut(n_correlated['# samples'], n_bins, precision = 0)
+if use_absolute_percentiles:
+    corr_std = np.std(np.abs(corr_flat))
+    percentile_std = (np.abs(corr_flat) < corr_std).sum() *100 / len(corr_flat)
+    percentile_65 = np.percentile(np.abs(corr_flat), 65)
+    percentile_90 = np.percentile(np.abs(corr_flat), 90)
+else:
+    corr_std = np.std(corr_flat)
+    percentile_std = (corr_flat < corr_std).sum() *100 / len(corr_flat)
+    percentile_65 = np.percentile(corr_flat, 65)
+    percentile_90 = np.percentile(corr_flat, 90)
+print(f'Metric              : {similarity_metric}')
+print(f'Standard deviation  : {corr_std:0.3f} ({percentile_std:0.2f}th percentile)')
+print(f'65th percentile     : {percentile_65:0.3f}')
+print(f'90th percentile     : {percentile_90:0.3f}')
 
-metrics_binned = {}
-for bin_ in n_correlated_binned.unique().sort_values():
-    mask = n_correlated_binned == bin_
-    bin_str = str(int(bin_.left)) + ' - ' + str(int(bin_.right)-1)
-    y_category = y[mask]
-    y_pred_category = y_pred_all.loc[mask, :]
-    metrics_binned[bin_str] = scores_to_metrics(y_pred_category.T, y_category)
+#%%% Plot correlation histogram
 
-bin_colname = f'# neighbors (absolute correlation >= {h:.3f})'
-bin_colname = '# of neighbors'
-metrics_binned = pd.concat(metrics_binned).reorder_levels([1, 2, 0]).sort_index()
-metrics_binned.index.names = ['Classifier', 'Model type', bin_colname]
-
-#%% -- Plot correlation histogram
-
+draw_threshold_lines = True
+bins = 100
 linewidth = 1
-plt.figure(figsize = (8, 4))
-plt.hist(corr_flat, bins = 300, 
+linestyle = '-'
+line_pad_percent = 15
+linecolor = 'C3'
+
+if H.index.astype(float).min() < 1:
+    threshold_text_formatter = r'$ ({:.3f})'
+else:
+    threshold_text_formatter = r'$ ({:.0f}th)'
+plt.figure(figsize = (6, 3))
+plt.hist(corr_flat, bins = bins, 
          alpha = 1, color = 'C0')
-ylims = plt.gca().get_ylim()
-colors = np.array(['C3' for i in range(len(H))])
-plt.vlines(np.hstack([-H, [0], H]), *ylims, linewidth = linewidth,
-           color = np.hstack([colors, ['#333'], colors]))
-#plt.axvline(0, color = '#333', linewidth = 1)
+if draw_threshold_lines:
+    ylims = plt.gca().get_ylim()
+    yticks = plt.gca().get_yticks()
+    y_top = ylims[1]
+    y_pad = ylims[1] * line_pad_percent/100
+    for i, (h_label, h) in enumerate(H.reset_index().values):
+        h_label = float(h_label)
+        plt.plot([-h, -h, h, h], [0, y_top, y_top, 0],
+                 color = linecolor, linewidth = linewidth, linestyle = linestyle)
+        line_label = r'$h_' + str(len(H)-i) + threshold_text_formatter.format(h_label)
+        plt.text(0, y_top + y_pad*0.05, line_label, va = 'bottom', ha = 'center',
+                 color = linecolor)
+        y_top += y_pad
+    plt.ylim(0, plt.gca().get_ylim()[1]+y_pad//2)
+    plt.yticks(yticks)
+    
+plt.ticklabel_format(axis='y', style='sci', scilimits=(4,4))
+offset_text = plt.gca().yaxis.get_offset_text()
+offset_text.set_x(-0.01)
+offset_text.set_ha('right')
+offset_text.set_va('top')
+plt.ylabel('Number of sample pairs')
+plt.xlabel('PCC')
+savefig('tcga_pairwise_correlation_distribution')
+plt.title('Distribution of pairwise correlation in TCGA samples')
+plt.show()
 std = np.std(np.abs(corr_flat))
+print(f'Standard deviation of abs correlations: {std:.2f}')
 percentiles = percentileofscore(np.abs(corr_flat), H)
 percentiles = pd.DataFrame(percentiles, index = H,
                            columns = ['absolute correlation percentile'])
 percentiles.index.name = 'threshold (h)'
-plt.ylim(*ylims)
-plt.ylabel('Number of sample pairs')
-plt.xlabel('Pearson correlation')
-plt.title('Distribution of pairwise correlation in TCGA samples')
-plt.show()
-print(f'Standard deviation of abs correlations: {std:.2f}')
-print(percentiles.round(2))
+print(percentiles.round(2).reset_index())
 
-#%% -- Plot distribution of the % of correlated neighbors
+#%% TCGA: [load] number of neighboring samples for each h-threshold
 
-fig, axes = plt.subplots(nrows = len(H), figsize = (6, len(H)),
-                         sharex = True)
-for i, (ax, h) in enumerate(zip(axes, H)):
-    ax.hist((np.abs(corr) >= h).sum(axis = 1)*100 / len(corr), bins = 50,
-            color = f'C{i}', label = str(h))
-    ax.legend()
-ax.set_xlabel(r'% of samples with absolute correlation $\geq$ threshold')
-plt.show()
+basedir = Path('.', 'results_v2', 'pan_cancer_stratified', 'TCGA')
+transform_name = 'PCA'
+augment_name = 'Baseline'
+classifier_names = ['RF', 'XGB']
 
-#%% -- Plot grouped performance
+
+y_pred_cfg = y_pred_combined[(transform_name, augment_name)]
+y_pred_cfg = y_pred_cfg[
+      [clf_name + '-Baseline' for clf_name in classifier_names] \
+    + ['MCS-' + clf_name for clf_name in classifier_names] \
+    + ['y_true']]
+y_true_cfg = y_pred_cfg.pop('y_true')
+n_neighbors = {}
+# Load number of neighbors
+paths_n_neighbors = sorted(list(Path(basedir, 'data', transform_name, augment_name).rglob('*local_set_idx_sample*')))
+for path_n_neighbors in paths_n_neighbors:
+
+    sample_id = int(path_n_neighbors.stem.split('_')[-1])
+    fold = int(path_n_neighbors.parts[-4].split('_')[-1])
+    h_label = path_n_neighbors.parent.name
+    n_neighbors_sample = len(np.loadtxt(path_n_neighbors))
+    n_neighbors[(fold, sample_id, h_label)] = n_neighbors_sample
+
+n_neighbors = pd.Series(n_neighbors)
+n_neighbors.index.names = ['Fold', 'Sample', 'h_label']
+n_neighbors = n_neighbors.unstack(level = 'h_label').sort_index().reset_index(drop = True)
+
+#%% TCGA: [plot] performance grouped by number of neighbors
+
+metric_names = ['AUC', 'F1', 'Balanced accuracy']
+n_bins = 3
+h = 75.0
+
+n_neighbors_binned = pd.qcut(n_neighbors[str(h)], n_bins, precision = 0)
+metrics_binned = {}
+for bin_ in n_neighbors_binned.unique().sort_values():
+    mask = n_neighbors_binned == bin_
+    bin_str = str('{:,}'.format(int(bin_.left))) \
+              + ' - ' + str('{:,}'.format(int(bin_.right)-1))
+    y_true_bin = y_true_cfg.loc[mask]
+    y_pred_bin = y_pred_cfg.loc[mask, :]
+    metrics_bin = scores_to_metrics(y_pred_bin.T, y_true_bin) 
+    metrics_bin = metrics_bin.reset_index()
+    metrics_bin['Classifier'] = metrics_bin['index'].apply(
+        lambda val: val.replace('-Baseline', '').replace('MCS-', ''))
+    metrics_bin['Model type'] = metrics_bin.apply(
+        lambda row: row['index'].replace(row['Classifier'], '').replace('-', ''), 
+        axis=1)
+    metrics_bin = (metrics_bin
+                   .drop('index', axis = 1)
+                   .set_index(['Classifier', 'Model type'], drop = True)
+                   .sort_index())
+    metrics_binned[bin_str] = metrics_bin
+    
+bin_colname = '# of neighbors'
+metrics_binned = pd.concat(metrics_binned).reorder_levels([1, 2, 0]).sort_index()
+metrics_binned.index.names = ['Classifier', 'Model type', bin_colname]
 
 ncols = len(metrics_binned.index.get_level_values('Classifier').unique())
 nrows = len(metric_names)
 fig, axes = plt.subplots(nrows = nrows, ncols = ncols,
-                         figsize = (ncols*2, nrows*2),
+                         figsize = (ncols*2, nrows),
                          sharex = True, sharey = True,
                          squeeze = False)
 for i, metric_name in enumerate(metric_names):
     for j, classifier_name in enumerate(metrics_binned.index.get_level_values('Classifier').unique()):
         ax = axes[i, j]
         data = metrics_binned.loc[classifier_name, metric_name].reset_index()
-        sns.barplot(data, x = bin_colname, y = metric_name, hue = 'Model type',
-                    ax = ax)
-        #ax.set_xticklabels(labels = ax.get_xticklabels(), ha = 'right')
-        ax.tick_params(axis = 'x', rotation = 45)
+        data.columns = list(data.columns[:-1]) \
+                        + [data.columns[-1].replace('Balanced accuracy',
+                                                    'Bal. acc.')]
+        x_order = sorted(data[bin_colname].unique(),
+                       key = lambda val: int(val.split(' -')[0].replace(',', '')))
+        sns.barplot(data, x = bin_colname, y = data.columns[-1], hue = 'Model type',
+                    order = x_order,
+                    ax = ax, width = 0.5)
         if i == 0 and j == ncols - 1:
             ax.legend(loc = 'upper left', bbox_to_anchor = [1, 1], title = 'Model type')
         else:
@@ -699,47 +1119,115 @@ for i, metric_name in enumerate(metric_names):
             ax.set_ylabel('')
         if i == 0 and len(classifier_names) > 1:
             ax.set_title(classifier_name)
+        ax.set_axisbelow(True)
         ax.grid()
         ax.set_xlabel('')
-        
+        if i == len(metric_names) - 1:
+            ax.set_xticklabels(ax.get_xticklabels(), rotation=40, ha='right')
 fig.add_subplot(111, frameon=False)
 plt.tick_params(labelcolor='none', which='both', top=False, bottom=False, left=False, right=False)
 plt.xlabel(bin_colname, labelpad = 50)
-plt.subplots_adjust(wspace = 0.05, hspace = 0.05)
+plt.subplots_adjust(wspace = 0.1, hspace = 0.1)
 savefig('tcga_correlation_grouped_performance')
 plt.show()
 
-#%% Models per sample
+#%%% Plot distribution of the % of correlated neighbors(for fixed H)
 
-# For every sample We only need to calculate the number of correlated samples
-# in both classes (0, 1). If any of these counts are 0 for a given threshold,
-# then the corresponding model was not trained.
+H = np.arange(0.15, 0.25+0.025, 0.025).round(3)
+H = n_neighbors.columns
+fig, axes = plt.subplots(nrows = len(H), figsize = (6, len(H)),
+                         sharex = True)
+for i, (ax, h) in enumerate(zip(axes, H)):
+    ax.hist(n_neighbors[h], bins = 50,
+            color = f'C{i}', label = str(h))
+    ax.legend()
+ax.set_xlabel('Distribution of the % of neighbors with\n' \
+              + r'absolute correlation $\geq$ threshold percentile')
+plt.show()
 
-dataloader_funcs = {'NKI': load_nki,
-                    'ACES': load_aces,
-                    'TCGA': load_tcga}
+#%% TCGA: count neighbors by type
 
-n_models = {}
-for dataset_name, dataloader_func in dataloader_funcs.items():
-    ds_obj = dataloader_func()
-    X, y = ds_obj.X, ds_obj.y
-    mat = np.corrcoef(X)
-    np.fill_diagonal(mat, 0)
+h = 0.2
+bin_count = 15
 
-    n_samples = {}
-    for h in H:
-        n_neighbors_0 = (np.abs(mat[:, y == 0]) >= h).sum(axis = 1)
-        n_neighbors_1 = (np.abs(mat[:, y == 1]) >= h).sum(axis = 1)
-        n_samples[h] = pd.DataFrame(np.vstack([n_neighbors_0,
-                                               n_neighbors_1]),
-                                    index = [0, 1])
-    n_samples = pd.concat(n_samples)
-    n_samples.index.names = ['h', 'label']
+ctypes = tcga_dataset.cancer_type
+n_cancers = np.unique(ctypes).size
+mask = pd.DataFrame(np.abs(corr) >= h)
+neighbors = mask.groupby(ctypes).sum().T
+index = np.array([np.where(neighbors.columns == ctype)[0][0] for ctype in ctypes])
+neighbor_count = neighbors.values[range(len(neighbors)), index]
+total_count = pd.Series(ctypes)
+total_count = total_count.map(total_count.value_counts())
+ctype_count = pd.Series(ctypes).value_counts()
+neighbor_percent = neighbor_count * 100 / total_count
+
+# Plot
+
+split_by_types = True
+n_cols = 4
+n_rows = int(np.ceil(n_cancers / n_cols))
+
+bin_range = np.linspace(0, neighbor_percent.max(), bin_count)
+n_rows = int(np.ceil(n_cancers / n_cols))
+fig, axes = plt.subplots(
+    nrows = n_rows,
+    ncols = n_cols,
+    figsize = (n_cols*2.5, n_rows*1)
+)
+
+data = pd.DataFrame(
+    [ctypes, tcga_dataset.y],
+    index = ['cancer type', 'outcome']).T
+data['percent of intra-cancer neighbors'] = neighbor_percent.values
+
+for i, cancer_type in enumerate(neighbors.columns):
+    ax = axes.flat[i]
+    df = data[data['cancer type'] == cancer_type]
+    #data['PFI'] = data['PFI'].replace(pfi_map)
+    if split_by_types:
+        sns.histplot(
+            data = df,
+            x = 'percent of intra-cancer neighbors',
+            hue = 'outcome',
+            multiple = 'stack',
+            ax = ax, bins = bin_range,
+            linewidth = 0)
+    else:
+        sns.histplot(
+            data = df,
+            x = 'percent of intra-cancer neighbors',
+            ax = ax, bins = bin_range,
+            linewidth = 0)
+    ax.set_ylabel('')
+    ax.set_xlabel('')
+    txt = f'{cancer_type}\nn = {ctype_count[cancer_type]}'
+    plt.text(0.99, 0.12, txt,
+             transform = ax.transAxes, ha = 'right', va = 'bottom')
+    ax.set_xlim(-10, 180)
+    ax.set_xticks([0, 50, 100])
+    if i + n_cols < n_cancers:
+        ax.set_xticklabels([])
+    sns.despine(ax = ax)
+    if i == n_cols - 1 and split_by_types:
+        sns.move_legend(
+            ax, "center left",
+            bbox_to_anchor = [1.1, 0.5],
+            title = 'Status',
+            frameon = False)
+    else:
+        ax.legend().remove()
+                        
+i += 1
+while i < axes.size:
+    axes.flat[i].axis('off')
+    i += 1
     
-    # Number of models for each sample
-    n_models[dataset_name] = (n_samples.groupby('h').min() != 0).sum(axis = 0)
-    
-print(pd.concat({k: df.describe() for k, df in n_models.items()}, axis = 1))
+fig.add_subplot(111, frameon=False)
+plt.tick_params(labelcolor='none', which='both', top=False, bottom=False, left=False, right=False)
+plt.xlabel(r'% of neighbors ($|\sigma| \geq $' + f'{h:.3f}) from within cancer', labelpad = 10)
+plt.ylabel('Count', labelpad = 10)
+plt.subplots_adjust(wspace = 0.3, hspace = 0.2)
+plt.show()
 
 #%% TCGA: network similarity for different distance measures
 
@@ -784,86 +1272,4 @@ axes[1].hist(nets['Spearman'], bins = 100)
 axes[0].set_ylabel('Pearson')
 axes[1].set_ylabel('Spearman')
 plt.subplots_adjust(hspace = 0.5)
-plt.show()
-    
-#%% ACES subtype-specific analysis
-
-path_scores = Path(f'{scores_basedir}/single_cancer/ACES')
-aces_dataset = load_aces()
-X, y = aces_dataset.X, aces_dataset.y
-subtypes = aces_dataset.attributes['subtypes']
-
-scores_aces = {}
-for classifier_name in classifier_names:
-    p = Path(f'{path_scores}/{classifier_name}')
-    test_idx = []
-    scores_clf = {}
-    for fold in range(10):
-        score_df = pd.read_csv(f'{p}/scores_fold_{fold}.csv', 
-                               sep = '\t', index_col = 0, header = [0, 1, 2]).T
-        scores_clf[fold] = score_df
-        test_idx.append(np.loadtxt(f'{p}/test_index_fold_{fold}.csv', dtype = int))
-    scores_clf = pd.concat(scores_clf, axis = 1)
-    test_idx = np.concatenate(test_idx)
-    scores_aces[classifier_name] = (scores_clf
-                                    .iloc[:, np.argsort(test_idx)]
-                                    .T.reset_index(drop = True).T)
-scores_aces = pd.concat(scores_aces, axis = 0)
-scores_aces.index.names = ['classifier'] + list(scores_aces.index.names[1:])
-aces_subtype_metrics = {}
-for subtype in subtypes.unique():
-    mask = (subtypes == subtype).values
-    aces_subtype_metrics[subtype] = scores_to_metrics(scores_aces.loc[:, mask], y[mask],
-                                                      p_threshold = threshold)
-aces_subtype_metrics = pd.concat(aces_subtype_metrics, axis = 0)
-aces_subtype_metrics.index.names = ['subtype'] \
-    + list(aces_subtype_metrics.index.names[1:-1]) \
-    + ['model']
-aces_subtype_metrics = aces_subtype_metrics.loc[(slice(None),
-                                                 slice(None),
-                                                 slice(None),
-                                                 'Baseline',
-                                                 ['0 (baseline)', 'MCS']), :]
-aces_subtype_metrics = aces_subtype_metrics.reset_index()
-aces_subtype_metrics['model'] = aces_subtype_metrics['model'].apply(lambda val: 'Baseline' if 'baseline' in val.lower() else val)
-aces_subtype_metrics = aces_subtype_metrics.set_index(['subtype', 'classifier', 'augmentation', 'transformation', 'model'])
-aces_subtype_metrics.index = aces_subtype_metrics.index.droplevel('transformation')
-
-# -- Plot
-
-augmentation = 'Baseline'
-classifier = 'XGB'
-metric_names = ['AUC', 'F1', 'Balanced accuracy']
-t = aces_subtype_metrics.reorder_levels(['model', 'augmentation', 'classifier', 'subtype']).sort_index()
-t = t.loc['MCS'] - t.loc['Baseline']
-t = t.loc[augmentation].stack().unstack(level = 'subtype')
-subtype_counts = subtypes.value_counts().sort_values()
-t = t.loc[classifier, subtype_counts.index]
-t.columns = [f'{col} ({subtype_counts.loc[col]:,})' for col in t.columns]
-
-sns.heatmap(t.loc[metric_names, :], annot = True, fmt = '.3f', center = 0, cmap = 'RdBu')
-plt.title(f'MCS-{classifier} improvement on ACES subtypes')
-plt.show()
-
-#%% ACES: sampled grouped by neighbors vs subtypes
-
-classifier_names = ['RF', 'XGB']
-metric_names = ['AUC', 'F1', 'Balanced accuracy']
-h = 0.15
-n_bins = 3
-
-corr = np.corrcoef(aces_dataset.X)
-corr_flat = squareform(corr, checks = False)
-
-
-n_correlated= (np.abs(corr) >= h).sum(axis = 1) - 1
-n_correlated = pd.DataFrame(n_correlated, columns = ['# samples'])
-n_correlated['median abs corr'] = np.median(np.abs(corr), axis = 1).ravel()
-
-n_correlated_binned = pd.qcut(n_correlated['# samples'], n_bins, precision = 0)
-
-sns.heatmap(pd.crosstab(subtypes, n_correlated_binned), annot = True, fmt = 'd')
-plt.xlabel(f'# of neighbors with |corr| >= {h}')
-plt.ylabel('Breast cancer subtype')
-plt.title('ACES')
 plt.show()
