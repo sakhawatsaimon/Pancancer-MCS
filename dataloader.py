@@ -46,13 +46,6 @@ def load_nki():
     nki_entrez_id = loadmat(basepath + 'vijver_gene_list.mat')['vijver_gene_list']
     nki_data = pd.DataFrame(nki_raw)
     nki_data.columns = nki_entrez_id.reshape(-1)
-    #getting the tfs
-    #human_tfs = get_tfs()
-    #get common tfs with the expression data
-    #common_tf = np.intersect1d(nki_data.columns, human_tfs.index)
-    #get index of these tfs for each data
-    #tf_locs = [nki_data.columns.get_loc(c) for c in common_tf]
-    
     return DataSet(nki_data.values, nki_p_type.ravel(), cancer_type = 'NKI_BRCA')
 
 def load_metabric():
@@ -76,7 +69,8 @@ def load_metabric():
     metabric_data = metabric_data.loc[:, (np.isnan(metabric_data).sum(axis = 0) == 0).values]
     return DataSet(metabric_data.values, metabric_p_type.ravel(), cancer_type = 'METABRIC_BRCA')
 
-def load_tcga(return_cancer_types = False):
+def load_tcga(return_survival_info = False):
+    global survival, expr
     basepath = './datasets/TCGA/'
     filename_expr = 'EB++AdjustPANCAN_IlluminaHiSeq_RNASeqV2.geneExp.xena.gz'
     filename_survival = 'Survival_SupplementalTable_S1_20171025_xena_sp'
@@ -101,9 +95,11 @@ def load_tcga(return_cancer_types = False):
     aggr_surv = t.groupby(by = c_type)['PFI.time'].quantile(qth)
     pfi_threshold = survival['cancer type abbreviation'].replace(aggr_surv)
     survival['s_label'] = 2
+    survival['PFI threshold'] = pfi_threshold
     survival.loc[(survival['PFI'] == 1) & (survival['PFI.time'] <= pfi_threshold), 's_label'] = 1
     survival.loc[(survival['PFI.time'] > pfi_threshold), 's_label'] = 0
-    survival = survival[(survival.s_label == 0) | (survival.s_label == 1)]
+    sample_filter_mask = (survival.s_label == 0) | (survival.s_label == 1)
+    survival_filtered = survival[sample_filter_mask]
 
     #reading expression file
     expr = pd.read_csv(basepath + filename_expr, index_col = 0, sep = '\t')
@@ -113,20 +109,26 @@ def load_tcga(return_cancer_types = False):
                             index_col = 0, sep = '\t')
     pc_genes = pc_genes[['symbol', 'name','entrez_id', 'ensembl_gene_id']]
     # only keep samples that are present in both expression data and survival metadata
-    common_samples = np.intersect1d(survival.index, expr.columns)
+    common_samples = np.intersect1d(survival_filtered.index, expr.columns)
     expr = expr.loc[np.intersect1d(expr.index, pc_genes.symbol),
                     common_samples]
-    survival = survival[survival.index.isin(common_samples)]
+    survival_filtered = survival_filtered[survival_filtered.index.isin(common_samples)]
 
     expr = expr.T
-    survival.sort_index(inplace = True)
+    survival_filtered.sort_index(inplace = True)
     expr.sort_index(inplace = True)
-    ds_obj = DataSet(expr.values, survival['s_label'].values, survival['cancer type abbreviation'].values)
+    ds_obj = DataSet(
+        expr.values,
+        survival_filtered['s_label'].values,
+        survival_filtered['cancer type abbreviation'].values)
+    if return_survival_info:
+        ds_obj.attributes['survival info'] = survival
     return ds_obj
 
 def load_single_cancer_datasets():
     yield 'NKI', load_nki()
     yield 'ACES', load_aces()
+    yield 'METABRIC', load_metabric()
     ds = load_tcga()
     X, y = ds.X, ds.y
     for cancer_type in np.unique(ds.cancer_type):

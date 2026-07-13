@@ -156,9 +156,9 @@ class FixedThresholdSelector(ThresholdSelector):
     def __init__(self, H = None):
         if H is None:
             H = np.arange(0.15, 0.25+0.025, 0.025).round(3)
-        self.threshold_labels = H.astype(str)
+        self.threshold_labels = [str(h) for h in H]
         self.H = H
-        
+
     def get_thresholds(self, *args, as_series = False):
         if as_series:
             return pd.Series(self.H, index = self.get_threshold_labels())
