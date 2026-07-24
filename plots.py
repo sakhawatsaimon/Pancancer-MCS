@@ -15,7 +15,6 @@ from scipy.spatial.distance import squareform
 from scipy.stats import percentileofscore, ttest_rel, spearmanr
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.decomposition import PCA
-from sklearn.model_selection import StratifiedKFold
 
 from utils import scores_to_metrics, PercentileThresholdSelector, FixedThresholdSelector
 from dataloader import load_aces, load_tcga
@@ -23,15 +22,8 @@ from dataloader import load_aces, load_tcga
 from pathlib import Path
 from itertools import combinations_with_replacement
 
-# random seed
-SEED = 2024
-FIGURE_SAVEDIR = './figures_v2'
+FIGURE_SAVEDIR = './figures'
 WRITE_RESULTS = True
-#results_basedir = './results_v2'
-#scores_basedir = f"{results_basedir}/pred_probability"
-#model_attr_basedir = f"{results_basedir}/feature_scores"
-#cache_basedir = f"{results_basedir}/cache"
-#data_basedir = f"{results_basedir}/data"
 
 tcga_dataset = load_tcga(return_survival_info = True)
 
@@ -289,7 +281,7 @@ plt.show()
 #%% TCGA: [calc] performance
 
 
-basedir = './results_v2'
+basedir = './results'
 path_experiment = Path(basedir, 'pan_cancer_stratified', 'TCGA')
 threshold = 0.25
 
@@ -530,7 +522,7 @@ plt.show()
 
 classifier_names = ['LR', 'RF', 'XGB']
 threshold = 0.25
-basedir = './results_v2'
+basedir = './results'
 path_experiment = Path(basedir, 'single_cancer')
 
 dirnames = np.array([d for d in path_experiment.iterdir() if d.is_dir()])
@@ -768,7 +760,7 @@ print(is_significant)
 
 metric_names = ['AUC', 'F1', 'Balanced accuracy']
 
-basedir = './results_v2/ablation'
+basedir = './results/ablation'
 dirnames = np.array([d for d in Path(basedir).iterdir() if d.is_dir()])
 metrics_similarity_mean = {}
 metrics_similarity_ci = {}
@@ -805,7 +797,7 @@ metrics_similarity_ci = metrics_dict['ci']
 
 #%% TCGA [load] runtimes
 
-basedir = './results_reworked'
+basedir = './results'
 runtime_dir = 'training_times'
 transform_name = 'PCA'
 augment_name = 'Baseline'
@@ -912,7 +904,7 @@ plt.show()
 
 #%% TCGA [load] h-thresholds
 
-basepath = './results_v2/pan_cancer_stratified'
+basepath = './results/pan_cancer_stratified'
 h_paths = Path(basepath).rglob('*H.csv')
 
 H = {}
@@ -942,7 +934,7 @@ plt.xlabel('Similarity threshold percentile')
 plt.ylabel('Similarity threshold value')
 plt.show()
 
-#%% TCGA: [calc] pairwise similarity and dataset-wise similarity thresholds
+#%% TCGA: [calc] pairwise correlation and dataset-wise similarity thresholds
 
 dataset_name = 'TCGA'
 similarity_metric = 'pearson'
@@ -963,7 +955,7 @@ elif similarity_metric == 'spearman':
 # Set diagonal to zero to avoid counting self-loops
 np.fill_diagonal(corr, 0)
 corr_flat = squareform(corr, checks = False)
-H = threshold_selector.get_thresholds(Xt, as_series = True)
+H = threshold_selector.get_thresholds(_, corr = corr, as_series = True)
 del Xt
 
 # Determine similarity percentiles
@@ -1035,7 +1027,7 @@ print(percentiles.round(2).reset_index())
 
 #%% TCGA: [load] number of neighboring samples for each h-threshold
 
-basedir = Path('.', 'results_v2', 'pan_cancer_stratified', 'TCGA')
+basedir = Path('.', 'results', 'pan_cancer_stratified', 'TCGA')
 transform_name = 'PCA'
 augment_name = 'Baseline'
 classifier_names = ['RF', 'XGB']
@@ -1066,7 +1058,6 @@ n_neighbors = n_neighbors.unstack(level = 'h_label').sort_index().reset_index(dr
 
 metric_names = ['AUC', 'F1', 'Balanced accuracy']
 n_bins = 3
-h = 75.0
 
 n_neighbors_binned = pd.qcut(n_neighbors[str(h)], n_bins, precision = 0)
 metrics_binned = {}
@@ -1145,57 +1136,79 @@ ax.set_xlabel('Distribution of the % of neighbors with\n' \
               + r'absolute correlation $\geq$ threshold percentile')
 plt.show()
 
-#%% TCGA: count neighbors by type
+#%% TCGA: self-affinity
 
-h = 0.2
-bin_count = 15
+h_percentile = 85
 
+h = PercentileThresholdSelector(
+    low_percentile = h_percentile,
+    high_percentile = h_percentile,
+    n_thresholds = 1).get_thresholds(_, corr = corr)[0]
+
+neighbor_info = pd.DataFrame(
+    [ctypes, tcga_dataset.y],
+    index = ['cancer type', 'y']).T
+neighbor_info['outcome'] = neighbor_info['y'].replace({0: 'Good', 1: 'Poor'})
 ctypes = tcga_dataset.cancer_type
 n_cancers = np.unique(ctypes).size
-mask = pd.DataFrame(np.abs(corr) >= h)
-neighbors = mask.groupby(ctypes).sum().T
+is_neighbor = pd.DataFrame(np.abs(corr) >= h)
+neighbors = is_neighbor.groupby(ctypes).sum().T
 index = np.array([np.where(neighbors.columns == ctype)[0][0] for ctype in ctypes])
-neighbor_count = neighbors.values[range(len(neighbors)), index]
-total_count = pd.Series(ctypes)
-total_count = total_count.map(total_count.value_counts())
+
+neighbor_info['total neighbors'] = is_neighbor.sum(axis = 1)
+# Number of neighbors from same ctype
+neighbor_info['self ctype neighbor count'] = neighbors.values[range(len(neighbors)), index]
+neighbor_info['other ctype neighbor count'] = \
+    neighbor_info['total neighbors'] - neighbor_info['self ctype neighbor count']
+
 ctype_count = pd.Series(ctypes).value_counts()
-neighbor_percent = neighbor_count * 100 / total_count
+# Number of total samples in respective ctype
+neighbor_info['self ctype total count'] = pd.Series(ctypes).map(ctype_count)
 
-# Plot
+# % of same-cancer neighbors (with respect to number of samples in cancer type)
+neighbor_info['self neighbor percent wrt self ctype'] = \
+    neighbor_info['self ctype neighbor count'] * 100 / neighbor_info['self ctype total count']
+# % of same-cancer neighbors (with respect to number of neighbors)
+neighbor_info['self neighbor percent wrt total neighbors'] = \
+    neighbor_info['self ctype neighbor count'] * 100 / neighbor_info['total neighbors']
 
-split_by_types = True
+#%%% Histogram plot
+
+bin_count = 30
+split_by_outcome = True
 n_cols = 4
-n_rows = int(np.ceil(n_cancers / n_cols))
 
-bin_range = np.linspace(0, neighbor_percent.max(), bin_count)
+field = 'self neighbor percent wrt self ctype'
+xlabel = '% of within-cancer samples in neighbors'
+
+field = 'self neighbor percent wrt total neighbors'
+xlabel = '% of neighbors from within-cancer samples' 
+
 n_rows = int(np.ceil(n_cancers / n_cols))
+bin_range = np.linspace(0, 100, bin_count)
 fig, axes = plt.subplots(
     nrows = n_rows,
     ncols = n_cols,
-    figsize = (n_cols*2.5, n_rows*1)
+    figsize = (n_cols*3, n_rows*0.65)
 )
-
-data = pd.DataFrame(
-    [ctypes, tcga_dataset.y],
-    index = ['cancer type', 'outcome']).T
-data['percent of intra-cancer neighbors'] = neighbor_percent.values
 
 for i, cancer_type in enumerate(neighbors.columns):
     ax = axes.flat[i]
-    df = data[data['cancer type'] == cancer_type]
+    df = neighbor_info[neighbor_info['cancer type'] == cancer_type]
     #data['PFI'] = data['PFI'].replace(pfi_map)
-    if split_by_types:
+    if split_by_outcome:
         sns.histplot(
             data = df,
-            x = 'percent of intra-cancer neighbors',
+            x = field,
             hue = 'outcome',
+            hue_order = ['Good', 'Poor'],
             multiple = 'stack',
             ax = ax, bins = bin_range,
             linewidth = 0)
     else:
         sns.histplot(
             data = df,
-            x = 'percent of intra-cancer neighbors',
+            x = field,
             ax = ax, bins = bin_range,
             linewidth = 0)
     ax.set_ylabel('')
@@ -1208,12 +1221,95 @@ for i, cancer_type in enumerate(neighbors.columns):
     if i + n_cols < n_cancers:
         ax.set_xticklabels([])
     sns.despine(ax = ax)
-    if i == n_cols - 1 and split_by_types:
+
+    if i == 0 and split_by_outcome:
+        handles = ax.legend_.legend_handles
+        labels = [text.get_text() for text in ax.legend_.texts]
+    ax.legend().remove()
+                        
+i += 1
+while i < axes.size:
+    axes.flat[i].axis('off')
+    i += 1
+    
+fig.add_subplot(111, frameon=False)
+plt.tick_params(labelcolor='none', which='both', top=False, bottom=False, left=False, right=False)
+plt.xlabel(xlabel + r' ($|\sigma| \geq $' \
+           + f'{h_percentile:.0f}th percentile)',
+           labelpad = 10)
+plt.ylabel('Count', labelpad = 10)
+plt.subplots_adjust(wspace = 0.3, hspace = 0.2)
+plt.legend(handles, labels, loc = 'lower center',
+           bbox_to_anchor = [0.5, 1], ncols = 2,
+           title = 'Outcome', frameon = False)
+savefig('tcga_in_group_neighbor_percentage')
+plt.show()
+
+#%%% Scatterplot
+
+split_by_outcome = True
+n_cols = 7
+markersize = 10
+log_scale = True
+x_field = 'self ctype neighbor count'
+y_field = 'other ctype neighbor count'
+
+
+n_rows = int(np.ceil(n_cancers / n_cols))
+fig, axes = plt.subplots(
+    nrows = n_rows,
+    ncols = n_cols,
+    figsize = (n_cols*1.5, n_rows*1.5),
+    sharex = log_scale,
+    sharey = log_scale
+)
+
+x_maxval = neighbor_info[x_field].max()
+y_maxval = neighbor_info[y_field].max()
+scaling_factor = 1.5
+xtick_max_logscale = int(np.ceil(np.log10(x_maxval)))
+ytick_max_logscale = int(np.ceil(np.log10(y_maxval)))
+for i, cancer_type in enumerate(neighbors.columns):
+    ax = axes.flat[i]
+    df = neighbor_info[neighbor_info['cancer type'] == cancer_type]
+    if split_by_outcome:
+        sns.scatterplot(
+            data = df,
+            x = x_field,
+            y = y_field,
+            hue = 'outcome',
+            ax = ax,
+            s = markersize)
+    else:
+        sns.scatterplot(
+            data = df,
+            x = x_field,
+            y = y_field,
+            ax = ax,
+            s = markersize)
+    ax.set_ylabel('')
+    ax.set_xlabel('')
+    txt = f'{cancer_type}\nn = {ctype_count[cancer_type]}'
+    txt = f'{cancer_type}'
+    #ax.set_ylim(np.multiply(ax.get_ylim(), [1, 1.2]))
+    if log_scale:
+        ax.set_xscale('log')
+        ax.set_yscale('log')
+        ax.set_xticks(10**np.arange(0, xtick_max_logscale))
+        ax.set_yticks(10**np.arange(0, ytick_max_logscale))
+        ax.set_xlim(1, x_maxval*scaling_factor)
+        ax.set_ylim(1, y_maxval*scaling_factor)
+    plt.text(0.02, 0.02, txt,
+             transform = ax.transAxes, ha = 'left', va = 'bottom')
+    if i + n_cols < n_cancers:
+        ax.set_xticklabels([])
+    sns.despine(ax = ax)
+    if i == n_cols - 1 and split_by_outcome:
         sns.move_legend(
             ax, "center left",
-            bbox_to_anchor = [1.1, 0.5],
-            title = 'Status',
-            frameon = False)
+            bbox_to_anchor = [1.05, 0.5],
+            title = 'Outcome',
+            frameon = True)
     else:
         ax.legend().remove()
                         
@@ -1224,9 +1320,12 @@ while i < axes.size:
     
 fig.add_subplot(111, frameon=False)
 plt.tick_params(labelcolor='none', which='both', top=False, bottom=False, left=False, right=False)
-plt.xlabel(r'% of neighbors ($|\sigma| \geq $' + f'{h:.3f}) from within cancer', labelpad = 10)
-plt.ylabel('Count', labelpad = 10)
-plt.subplots_adjust(wspace = 0.3, hspace = 0.2)
+plt.xlabel(f'# of {h_percentile:.0f}th percentile neighbors in the same cancer type',
+           labelpad = 10)
+plt.ylabel(f'# of {h_percentile:.0f}th percentile neighbors in other cancer types',
+           labelpad = 20)
+plt.subplots_adjust(wspace = 0.15, hspace = 0.2)
+savefig('tcga_outgroup_vs_ingroup')
 plt.show()
 
 #%% TCGA: network similarity for different distance measures
